@@ -1,0 +1,33 @@
+name: Tokashiki Ferry Logger
+
+on:
+  schedule:
+    - cron: '15 23 * * *'   # 08:15 JST（UTC 23:15 前日）
+  workflow_dispatch:         # 手動実行も可能
+
+permissions:
+  contents: read
+
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      GOOGLE_SHEETS_ID_TOKASHIKI: ${{ secrets.GOOGLE_SHEETS_ID_TOKASHIKI }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml gspread google-auth
+
+      - name: Run logger
+        run: python tokashiki_logger.py
