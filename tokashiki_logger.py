@@ -339,8 +339,12 @@ def _parse_text_section(text, notice_text=""):
 
         bin_index += 1
 
-    combined = " ".join(cancel_texts) + " " + notice_text
-    reason = _cancel_reason(combined) if (cancel_texts or any(kw in notice_text for kw in ["ドック", "欠航"])) else "none"
+    # cancel_texts が空（欠航行なし）なら "none"。_parse_table と同じ方針。
+    if cancel_texts:
+        combined = " ".join(cancel_texts) + " " + notice_text
+        reason = _cancel_reason(combined)
+    else:
+        reason = "none"
     return bins, reason
 
 
