@@ -162,13 +162,18 @@ def get_tokashiki_operation_status():
                 thead = table.find("thead")
                 if thead:
                     context = thead.get_text()
-                prev = table.find_previous(["h1", "h2", "h3", "h4", "p", "div"])
-                if prev:
-                    context += prev.get_text()
+                # prev は「直前の兄弟要素」に限定する。
+                # find_previous() は祖先DOMまで遡るため、
+                # 2つ目のテーブルの prev が1つ目テーブルのwrapper divを返し
+                # 「マリンライナー」テキストがcontextに混入する不具合を防ぐ。
+                if not any(kw in context for kw in ["マリンライナー", "フェリーとかしき", "高速船"]):
+                    prev_sib = table.find_previous_sibling()
+                    if prev_sib:
+                        context += prev_sib.get_text()
 
             if "マリンライナー" in context or "高速船" in context:
                 marine_table = table
-            elif "フェリー" in context:
+            elif "フェリーとかしき" in context or "フェリー" in context:
                 ferry_table = table
 
         # テーブル1つだけ検出された場合の補完
@@ -267,9 +272,11 @@ def _parse_table(table, notice_text=""):
         bins.append({"time": time_text, "operated": operated})
         bin_index += 1
 
-    # 欠航理由：テーブルのステータス + お知らせ文を合わせて判定
-    combined = " ".join(cancel_texts) + " " + notice_text
-    if cancel_texts or any(kw in notice_text for kw in ["ドック", "欠航", "運休"]):
+    # 欠航理由：この便自体に欠航行があった場合のみ判定。
+    # notice_text はページ全体（他船のドック情報を含む）なので、
+    # cancel_texts が空の場合は "none" とし、他船の情報で汚染しない。
+    if cancel_texts:
+        combined = " ".join(cancel_texts) + " " + notice_text
         reason = _cancel_reason(combined)
     else:
         reason = "none"
@@ -340,16 +347,22 @@ def _parse_text_section(text, notice_text=""):
 def _judge_from_text(full_text, notice_text, ship_name):
     """
     便別データが取れなかった場合のフォールバック。
-    ship_name 近傍テキスト + notice_text から運航状況を推定。
+    ship_name 近傍テキストから運航状況を推定。
+    notice_text は他船の情報を含む場合があるため、
+    ship_name が明示的に含まれる場合のみ参照する。
     戻り値: (operated: 1/0/None, cancel_reason)
     """
     pos = full_text.find(ship_name)
-    context = (full_text[pos:pos + 300] if pos >= 0 else "") + " " + notice_text
+    context = (full_text[pos:pos + 300] if pos >= 0 else "")
 
     if any(kw in context for kw in ["運休", "欠航", "中止"]):
         return 0, _cancel_reason(context)
     if any(kw in context for kw in ["定刻", "出港", "通常運航"]):
         return 1, "none"
+    # notice_text は ship_name が明示されている場合のみ使用
+    if ship_name in notice_text:
+        if any(kw in notice_text for kw in ["運休", "欠航", "中止", "ドック"]):
+            return 0, _cancel_reason(notice_text)
     return None, "none"
 
 
