@@ -24,8 +24,16 @@ from bs4 import BeautifulSoup
 JST = ZoneInfo("Asia/Tokyo")
 
 # 渡嘉敷航路の気象データ取得ポイント
-# 那覇泊港（26.22, 127.68）〜渡嘉敷（26.19, 127.36）の中間・慶良間海峡の外洋部
-# ※座間味と同じ慶良間海峡を通るため、ほぼ同一の気象条件
+# 那覇泊港（26.22, 127.68）〜渡嘉敷（26.19, 127.36）。座間味と同じ慶良間海峡を通る。
+# 単一の中間点では航路上の最悪区間を過小評価する（実測：2026/6/1の高波時、
+# 中央127.45=5.4m に対し海峡中央寄り127.52=7.0m、+28%）。
+# このため航路代表3地点を取得し各日で最も荒れる値を採用する（ferry_alert.py と同方針）。
+ROUTE_POINTS = [
+    (26.198, 127.37, "渡嘉敷港沖"),
+    (26.205, 127.52, "海峡中央"),
+    (26.21,  127.60, "泊沖"),
+]
+# 後方互換・参照用の航路中央点
 ROUTE_LAT = 26.20
 ROUTE_LON = 127.45
 
@@ -381,8 +389,15 @@ def _get_bin(bins, idx):
 # 2. Open-Meteo 海洋・気象データ取得
 # ============================================================
 
+def _as_location_list(data):
+    """Open-Meteoレスポンスを地点リストに正規化（単一地点はdict、複数地点はlistで返る）。"""
+    return data if isinstance(data, list) else [data]
+
+
 def get_marine_weather_data():
-    """Open-Meteo から慶良間海峡の海洋・気象データを取得。"""
+    """Open-Meteo から慶良間海峡の海洋・気象データを取得。
+    航路代表3地点（ROUTE_POINTS）を1リクエストで取得し、各日で全地点の
+    最大値（最悪値）を採用する。単一中間点による最悪区間の過小評価を防ぐ。"""
     result = {
         "today_max_wave":    None,
         "today_max_swell":   None,
@@ -394,40 +409,49 @@ def get_marine_weather_data():
     }
 
     try:
+        lats = ",".join(str(p[0]) for p in ROUTE_POINTS)
+        lons = ",".join(str(p[1]) for p in ROUTE_POINTS)
+
         marine_url = (
             f"https://marine-api.open-meteo.com/v1/marine"
-            f"?latitude={ROUTE_LAT}&longitude={ROUTE_LON}"
+            f"?latitude={lats}&longitude={lons}"
             f"&hourly=wave_height,swell_wave_height"
             f"&timezone=Asia%2FTokyo&forecast_days=3"
         )
-        marine_data = requests.get(marine_url, timeout=15).json()
+        marine_locs = _as_location_list(requests.get(marine_url, timeout=15).json())
 
         weather_url = (
             f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={ROUTE_LAT}&longitude={ROUTE_LON}"
+            f"?latitude={lats}&longitude={lons}"
             f"&hourly=wind_speed_10m"
             f"&wind_speed_unit=ms"
             f"&timezone=Asia%2FTokyo&forecast_days=3"
         )
-        weather_data = requests.get(weather_url, timeout=15).json()
+        weather_locs = _as_location_list(requests.get(weather_url, timeout=15).json())
 
         now = datetime.now(JST)
 
-        def _daily_max(data, key, delta):
+        def _daily_max(locs, key, delta):
+            """全地点・指定日（delta日後）を通じた最大値（最悪値）を返す。"""
             target = (now + timedelta(days=delta)).strftime("%Y-%m-%d")
-            times  = data.get("hourly", {}).get("time", [])
-            values = data.get("hourly", {}).get(key, [])
-            vals   = [v for t, v in zip(times, values)
-                      if t.startswith(target) and v is not None]
-            return round(max(vals), 2) if vals else None
+            best = None
+            for loc in locs:
+                times  = loc.get("hourly", {}).get("time", [])
+                values = loc.get("hourly", {}).get(key, [])
+                vals   = [v for t, v in zip(times, values)
+                          if t.startswith(target) and v is not None]
+                if vals:
+                    m = max(vals)
+                    best = m if best is None else max(best, m)
+            return round(best, 2) if best is not None else None
 
-        result["today_max_wave"]    = _daily_max(marine_data,  "wave_height",       0)
-        result["today_max_swell"]   = _daily_max(marine_data,  "swell_wave_height", 0)
-        result["today_max_wind"]    = _daily_max(weather_data, "wind_speed_10m",    0)
-        result["tmr_max_wave"]      = _daily_max(marine_data,  "wave_height",       1)
-        result["tmr_max_swell"]     = _daily_max(marine_data,  "swell_wave_height", 1)
-        result["tmr_max_wind"]      = _daily_max(weather_data, "wind_speed_10m",    1)
-        result["dayafter_max_wave"] = _daily_max(marine_data,  "wave_height",       2)
+        result["today_max_wave"]    = _daily_max(marine_locs,  "wave_height",       0)
+        result["today_max_swell"]   = _daily_max(marine_locs,  "swell_wave_height", 0)
+        result["today_max_wind"]    = _daily_max(weather_locs, "wind_speed_10m",    0)
+        result["tmr_max_wave"]      = _daily_max(marine_locs,  "wave_height",       1)
+        result["tmr_max_swell"]     = _daily_max(marine_locs,  "swell_wave_height", 1)
+        result["tmr_max_wind"]      = _daily_max(weather_locs, "wind_speed_10m",    1)
+        result["dayafter_max_wave"] = _daily_max(marine_locs,  "wave_height",       2)
 
         print(f"  [Open-Meteo] 本日 波高{result['today_max_wave']}m "
               f"うねり{result['today_max_swell']}m 風速{result['today_max_wind']}m/s")
