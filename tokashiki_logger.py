@@ -554,6 +554,13 @@ def log_daily_record():
     except Exception as e:
         print(f"  [エラー] Sheets書き込み失敗: {e}")
 
+    # Instagram投稿（欠航リスク予報カルーセル）
+    try:
+        from tokashiki_publisher import run_tokashiki_publisher
+        run_tokashiki_publisher(weather=weather)
+    except Exception as e:
+        print(f"  [警告] Instagram投稿エラー: {e}")
+
 
 # ============================================================
 # エントリーポイント

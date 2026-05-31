@@ -6,16 +6,20 @@ on:
   workflow_dispatch:         # 手動実行も可能
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   log:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     env:
       GOOGLE_SHEETS_ID_TOKASHIKI: ${{ secrets.GOOGLE_SHEETS_ID_TOKASHIKI }}
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+      INSTAGRAM_USER_ID: ${{ secrets.INSTAGRAM_USER_ID }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
 
     steps:
       - name: Checkout
@@ -27,7 +31,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests beautifulsoup4 lxml gspread google-auth
+        run: pip install requests beautifulsoup4 lxml gspread google-auth pillow
 
       - name: Run logger
         run: python tokashiki_logger.py
