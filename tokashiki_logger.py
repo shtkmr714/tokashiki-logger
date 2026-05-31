@@ -469,13 +469,13 @@ def get_marine_weather_data():
 # ============================================================
 
 def log_daily_record():
-    """メイン関数。データを収集してGoogle Sheetsに1行追加する。"""
+    """メイン関数。データを収集してGoogle Sheetsに1行追加する。戻り値: weather dict or None"""
     sheets_id = os.environ.get("GOOGLE_SHEETS_ID_TOKASHIKI")
     svc_json  = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 
     if not sheets_id or not svc_json:
         print("  [スキップ] 環境変数未設定（GOOGLE_SHEETS_ID_TOKASHIKI / GOOGLE_SERVICE_ACCOUNT_JSON）")
-        return
+        return None
 
     try:
         import gspread
@@ -497,7 +497,7 @@ def log_daily_record():
 
     except Exception as e:
         print(f"  [エラー] Sheets接続失敗: {e}")
-        return
+        return None
 
     now = datetime.now(JST)
     today_str = now.strftime("%Y-%m-%d")
@@ -506,7 +506,7 @@ def log_daily_record():
         existing = ws.col_values(1)
         if today_str in existing:
             print(f"  [スキップ] {today_str} の記録はすでに存在します")
-            return
+            return None   # publisher は __main__ から呼ぶ
     except Exception as e:
         print(f"  [警告] 重複チェックエラー（続行）: {e}")
 
@@ -554,12 +554,7 @@ def log_daily_record():
     except Exception as e:
         print(f"  [エラー] Sheets書き込み失敗: {e}")
 
-    # Instagram投稿（欠航リスク予報カルーセル）
-    try:
-        from tokashiki_publisher import run_tokashiki_publisher
-        run_tokashiki_publisher(weather=weather)
-    except Exception as e:
-        print(f"  [警告] Instagram投稿エラー: {e}")
+    return weather   # __main__ で publisher に渡す
 
 
 # ============================================================
@@ -570,5 +565,11 @@ if __name__ == "__main__":
     print("=" * 50)
     print(f"Tokashiki Ferry Logger: {datetime.now(JST).strftime('%Y-%m-%d %H:%M')}")
     print("=" * 50)
-    log_daily_record()
+    weather = log_daily_record()
+    # Sheets スキップ時も Publisher は必ず実行
+    try:
+        from tokashiki_publisher import run_tokashiki_publisher
+        run_tokashiki_publisher(weather=weather)
+    except Exception as e:
+        print(f"  [警告] Instagram投稿エラー: {e}")
     print("\n完了。")
