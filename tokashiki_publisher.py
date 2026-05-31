@@ -437,9 +437,9 @@ def make_image_longterm(forecast, output_path):
                       font=f["bar"], fill=_get_risk_text_color(pct), anchor="lm")
 
     draw.line([(60, 920), (1020, 920)], fill=(255,255,255,50), width=1)
-    draw.text((540, 950), "※AI予測・参考値。判定は座間味（慶良間）と同じスコア式を使用。",
+    draw.text((540, 950), "※AI予測・参考値。欠航判断は公式発表に基づきます。",
               font=f["xs"], fill=(255,255,255,140), anchor="mm")
-    draw.text((540, 972), "*Same scoring model as Zamami/Kerama route. AI estimates only.",
+    draw.text((540, 972), "*AI estimates only. Check official announcements for cancellations.",
               font=f["xs"], fill=(255,255,255,110), anchor="mm")
 
     img.save(output_path)
@@ -462,10 +462,10 @@ def make_image_weatherdata(forecast, output_path):
         draw.text((80, y + 22), f"【{ja} / {en}】", font=f["sec"], fill="#7EB3F5", anchor="lm")
         return y + 60
 
-    def row(y, icon, label_ja, label_en, value):
-        draw.text((80,  y),     f"{icon} {label_ja}", font=_load_font(FONT_REGULAR, 20), fill="#BBDEFB", anchor="lm")
-        draw.text((96,  y+24),  label_en,              font=_load_font(FONT_REGULAR, 17), fill="#7986CB", anchor="lm")
-        draw.text((1010, y+12), str(value),             font=_load_font(FONT_MEDIUM, 20),  fill="white",   anchor="rm")
+    def row(y, label_ja, label_en, value):
+        draw.text((80,  y),     label_ja,  font=_load_font(FONT_REGULAR, 20), fill="#BBDEFB", anchor="lm")
+        draw.text((96,  y+24),  label_en,  font=_load_font(FONT_REGULAR, 17), fill="#7986CB", anchor="lm")
+        draw.text((1010, y+12), str(value), font=_load_font(FONT_MEDIUM, 20),  fill="white",   anchor="rm")
         return y + 56
 
     def _fmt(v, unit=""): return f"{v:.1f}{unit}" if v is not None else "—"
@@ -481,31 +481,29 @@ def make_image_weatherdata(forecast, output_path):
 
         y = section_header(y, f"{label_ja} {dt.month}/{dt.day}({DAY_JA[dt.weekday()]})",
                            f"{label_en} {dt.strftime('%b %-d')}")
-        y = row(y, "🌊", "最大波高",  "Max Wave Height",     _fmt(d.get("max_wave"),  " m"))
-        y = row(y, "🌊", "最大うねり", "Max Swell Height",   _fmt(d.get("max_swell"), " m"))
-        y = row(y, "💨", "最大風速",  "Max Wind Speed",      _fmt(d.get("max_wind"),  " m/s"))
+        y = row(y, "最大波高",  "Max Wave Height",         _fmt(d.get("max_wave"),  " m"))
+        y = row(y, "最大うねり", "Max Swell Height",        _fmt(d.get("max_swell"), " m"))
+        y = row(y, "最大風速",  "Max Wind Speed",           _fmt(d.get("max_wind"),  " m/s"))
 
         hs_pct = d.get("hs_pct")
         fe_pct = d.get("fe_pct")
-        y = row(y, "⛵", "高速船 欠航リスク", "Marine Liner Cancel Risk",
+        y = row(y, "高速船 欠航リスク", "Marine Liner Cancel Risk",
                 f"{hs_pct}%" if hs_pct is not None else "—")
-        y = row(y, "🚢", "フェリー 欠航リスク", "Ferry Cancel Risk",
+        y = row(y, "フェリー 欠航リスク", "Ferry Cancel Risk",
                 f"{fe_pct}%" if fe_pct is not None else "—")
         y += 12
 
-    y = section_header(y, "スコア式", "Scoring Model (Same as Zamami/Kerama)")
-    row(y, "📐", "波高×0.35 + うねり×0.30 + 風速×0.20", "Sigmoid → cancel %", "")
-
-    y += 70
+    y += 8
     draw.line([(60, y), (1020, y)], fill="#334E7A", width=1)
     draw.rectangle([(60, y + 8), (1020, y + 52)], fill="#1A3057")
     draw.text((80, y + 30), "【情報源】  Open-Meteo Marine API  /  渡嘉敷フェリーポータル tokashiki-ferry.jp",
               font=_load_font(FONT_REGULAR, 17), fill="#7EB3F5", anchor="lm")
 
-    draw.line([(60, 1010), (1020, 1010)], fill="#334E7A", width=1)
-    draw.text((540, 1030), "※欠航判断は村営渡嘉敷村フェリー運航会社が行います。AI参考値。",
+    footer_y = y + 72
+    draw.line([(60, footer_y), (1020, footer_y)], fill="#334E7A", width=1)
+    draw.text((540, footer_y + 20), "※欠航判断は村営渡嘉敷村フェリー運航会社が行います。AI参考値。",
               font=_load_font(FONT_REGULAR, 16), fill="#546E7A", anchor="mm")
-    draw.text((540, 1052), f"生成: {now.strftime('%Y-%m-%d %H:%M')} JST",
+    draw.text((540, footer_y + 42), f"生成: {now.strftime('%Y-%m-%d %H:%M')} JST",
               font=_load_font(FONT_REGULAR, 16), fill="#37474F", anchor="mm")
 
     img.save(output_path)
@@ -651,9 +649,9 @@ def run_tokashiki_publisher(weather=None):
     print(f"Tokashiki Publisher: {now.strftime('%Y-%m-%d %H:%M')}")
     print("="*50)
 
-    # [P1] 7日間予報取得
-    print("\n[P1] 7日間予報取得中（3地点 batched）...")
-    day_list = _fetch_forecast(days=7)
+    # [P1] 8日間予報取得（3〜7日先 = index3〜7 を表示するため8日分必要）
+    print("\n[P1] 8日間予報取得中（3地点 batched）...")
+    day_list = _fetch_forecast(days=8)
 
     # Day1 はロガー取得済みデータで上書き（精度優先・API節約）
     if weather:
