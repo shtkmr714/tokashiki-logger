@@ -612,23 +612,30 @@ def _post_to_instagram(image_urls, caption):
 
 
 def _build_caption(forecast, now):
-    tmr   = now + timedelta(days=1)
+    tmr    = now + timedelta(days=1)
     DAY_JA = ["月","火","水","木","金","土","日"]
-    d1    = forecast[1] if len(forecast) > 1 else {}
-    lines = [
-        f"🚢 渡嘉敷航路 欠航リスク予報 {tmr.month}/{tmr.day}({DAY_JA[tmr.weekday()]})", ""
+    DAY_EN = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    MON_EN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    d1     = forecast[1] if len(forecast) > 1 else {}
+    lines  = [
+        f"🚢 渡嘉敷航路 欠航リスク予報  {tmr.month}/{tmr.day}({DAY_JA[tmr.weekday()]})",
+        f"🚢 Tokashiki Route  Cancellation Risk  {MON_EN[tmr.month-1]} {tmr.day} ({DAY_EN[tmr.weekday()]})",
+        "",
     ]
     hs_pct = d1.get("hs_pct")
     fe_pct = d1.get("fe_pct")
     if hs_pct is not None:
         icon = "🔴" if hs_pct >= 70 else ("🟡" if hs_pct >= 40 else "🟢")
-        lines.append(f"{icon} マリンライナーとかしき: {hs_pct}%")
+        lines.append(f"{icon} マリンライナーとかしき / Marine Liner Tokashiki: {hs_pct}%")
     if fe_pct is not None:
         icon = "🔴" if fe_pct >= 70 else ("🟡" if fe_pct >= 40 else "🟢")
-        lines.append(f"{icon} フェリーとかしき: {fe_pct}%")
+        lines.append(f"{icon} フェリーとかしき / Ferry Tokashiki: {fe_pct}%")
     lines += [
-        "", "📊 詳細は画像スワイプでご確認ください。",
-        "⚠️ AI予測・参考値。欠航判断は公式HPをご確認ください。", "",
+        "",
+        "📊 詳細は画像スワイプでご確認ください。/ Swipe for details.",
+        "⚠️ AI予測・参考値。欠航判断は公式HPをご確認ください。",
+        "⚠️ AI estimates only. Check official site for cancellations.",
+        "",
         "#渡嘉敷島 #渡嘉敷 #慶良間諸島 #沖縄離島 #欠航予報",
         "#Tokashiki #KeramaIslands #OkinawaFerry #JapanTravel",
     ]
