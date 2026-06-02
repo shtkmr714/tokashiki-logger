@@ -758,8 +758,22 @@ def _post_to_instagram(image_urls, caption):
         return False
 
     try:
-        print("  [Instagram] GitHub Pages ビルド待機（90秒）...")
-        time.sleep(90)
+        # GitHub Pages が実際にファイルを配信するまでポーリング（最大5分）
+        check_url = image_urls[0]
+        print(f"  [Instagram] GitHub Pages 配信確認中（最大5分）: {check_url}")
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            try:
+                r = requests.head(check_url, timeout=10, allow_redirects=True)
+                if r.status_code == 200:
+                    print(f"  [Instagram] 配信確認OK（{r.status_code}）→ Instagram投稿開始")
+                    break
+                print(f"  [Instagram] まだ未配信（{r.status_code}）... 15秒後再確認")
+            except Exception:
+                print("  [Instagram] 疎通確認エラー... 15秒後再確認")
+            time.sleep(15)
+        else:
+            print("  [警告] GitHub Pages 5分待機タイムアウト。そのまま試行します")
 
         media_ids = []
         for img_url in image_urls:
