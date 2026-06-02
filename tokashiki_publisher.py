@@ -12,7 +12,7 @@ tokashiki_logger.py の log_daily_record() から呼び出す。
 投稿: 3枚カルーセル
   1枚目: 短期予報（明日・明後日 / 高速船・フェリー）
   2枚目: 長期予報（3〜7日先）
-  3枚目: 予報根拠データ
+  3枚目: 予報根拠データ（JMA + 数値予測 + 情報源）
 """
 
 import os
@@ -108,13 +108,6 @@ def _get_bg_color(pct):
     else:                         return "#B71C1C"
 
 
-def _get_risk_text_color(pct):
-    if pct is None or pct <= 30:  return "#66FF80"
-    elif pct <= 60:               return "#FFD54F"
-    elif pct <= 80:               return "#FF8A50"
-    else:                         return "#FF6666"
-
-
 def _hex_to_rgb(h):
     h = h.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
@@ -149,10 +142,101 @@ def _score_to_pct_ferry(score):
 
 
 # ============================================================
+# JMA データ取得（座間味と同じ area 471000）
+# ============================================================
+
+def _get_jma_forecast_waves():
+    """
+    気象庁forecast JSONから沖縄地方の波高テキスト予報を取得。
+    {"今日": "1メートル後2メートル", "明日": "3メートル", "明後日": "4メートル"}
+    """
+    try:
+        url = "https://www.jma.go.jp/bosai/forecast/data/forecast/471000.json"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        result = {}
+        for series in data[0].get("timeSeries", []):
+            times = series.get("timeDefines", [])
+            for area in series.get("areas", []):
+                waves = area.get("waves", [])
+                if not waves:
+                    continue
+                area_name = area.get("area", {}).get("name", "")
+                if "中南部" not in area_name and "南部" not in area_name:
+                    continue
+                for i, wave in enumerate(waves):
+                    if i < len(times):
+                        dt = datetime.fromisoformat(times[i])
+                        delta = (dt.date() - datetime.now(JST).date()).days
+                        label = {0: "今日", 1: "明日", 2: "明後日"}.get(delta)
+                        if label and wave:
+                            result[label] = wave
+                if result:
+                    break
+        return result
+    except Exception as e:
+        print(f"  [警告] JMA波浪予報取得失敗: {e}")
+        return {}
+
+
+def _get_jma_probability():
+    """
+    気象庁早期注意情報（471000: 沖縄県）から波浪警報級確率を取得。
+    {"明日": {"type": "...", "level": "中"}, "明後日": {"type": "...", "level": "なし"}}
+    """
+    try:
+        url = "https://www.jma.go.jp/bosai/probability/data/probability/471000.json"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        result = {}
+        for entry in data:
+            for series in entry.get("timeSeries", []):
+                time_defines = series.get("timeDefines", [])
+                for area in series.get("areas", []):
+                    if area.get("code") != "471010":
+                        continue
+                    for i, time_str in enumerate(time_defines):
+                        dt = datetime.fromisoformat(time_str)
+                        delta = (dt.date() - datetime.now(JST).date()).days
+                        label = {1: "明日", 2: "明後日"}.get(delta)
+                        if not label:
+                            continue
+                        for prop in area.get("properties", []):
+                            prop_type = prop.get("type", "")
+                            if "波浪" not in prop_type and "高波" not in prop_type:
+                                continue
+                            parts = prop.get("parts", [])
+                            if i < len(parts):
+                                level = parts[i].get("level", "")
+                                if level:
+                                    result[label] = {"type": prop_type, "level": level}
+        return result
+    except Exception as e:
+        print(f"  [警告] JMA早期注意情報取得失敗: {e}")
+        return {}
+
+
+def _fmt_wave(text):
+    """気象庁波高テキストを整形（メートル→m）"""
+    if not text:
+        return "—"
+    return text.replace("メートル", "m").replace(" ", "")
+
+
+def _fmt_prob(text):
+    """警報級確率テキストを整形"""
+    if not text or text in ("なし", ""):
+        return "なし / None"
+    return text
+
+
+# ============================================================
 # Open-Meteo: 複数地点 batched 取得（最悪値採用）
 # ============================================================
 
-def _fetch_forecast(days=7, timeout=30, max_retries=3):
+def _fetch_forecast(days=8, timeout=30, max_retries=3):
     """
     ROUTE_POINTS の3地点を1リクエストに集約し、
     各日で全地点の最悪値を採用した day_list を返す。
@@ -200,9 +284,9 @@ def _fetch_forecast(days=7, timeout=30, max_retries=3):
         def _worst(locs, key):
             best = None
             for loc in (locs or []):
-                times = loc.get("hourly", {}).get("time", [])
+                times_list = loc.get("hourly", {}).get("time", [])
                 vals  = loc.get("hourly", {}).get(key, [])
-                v = [v for t, v in zip(times, vals) if t.startswith(target) and v is not None]
+                v = [v for t, v in zip(times_list, vals) if t.startswith(target) and v is not None]
                 if v:
                     m = max(v)
                     best = m if best is None else max(best, m)
@@ -219,137 +303,220 @@ def _fetch_forecast(days=7, timeout=30, max_retries=3):
 
 
 # ============================================================
-# 予報データ構築
+# 予報データ構築（座間味と同じ構造の dict を返す）
 # ============================================================
 
-def _build_forecast(day_list):
+def _build_forecast_data(day_list, jma_waves=None, jma_prob=None):
     """
-    day_list から高速船・フェリーの欠航確率%を計算。
-    戻り値: [{"date", "hs_pct", "fe_pct"}, ...]（7日分）
+    day_list から構造化予報データを構築。
+    short_term（明日・明後日）、long_term（3〜7日先）、weather_data を返す。
     """
-    result = []
-    for d in day_list:
-        score   = _calc_score(d["max_wave"], d["max_swell"], d["max_wind"])
-        hs_pct  = _score_to_pct_highspeed(score) if d["max_wave"] is not None else None
-        fe_pct  = _score_to_pct_ferry(score)      if d["max_wave"] is not None else None
-        result.append({
-            "date":     d["date"],
-            "hs_pct":   hs_pct,
-            "fe_pct":   fe_pct,
-            "max_wave": d["max_wave"],
-            "max_swell":d["max_swell"],
-            "max_wind": d["max_wind"],
+    jma_waves = jma_waves or {}
+    jma_prob  = jma_prob  or {}
+    now = datetime.now(JST)
+
+    # --- short_term ---
+    short_term = []
+    for delta in [1, 2]:
+        d     = day_list[delta] if delta < len(day_list) else {}
+        dt    = now + timedelta(days=delta)
+        score = _calc_score(d.get("max_wave"), d.get("max_swell"), d.get("max_wind"))
+        if d.get("max_wave") is not None:
+            hs_pct = _score_to_pct_highspeed(score)
+            fe_pct = _score_to_pct_ferry(score)
+        else:
+            hs_pct = fe_pct = None
+        label_ja = "明日" if delta == 1 else "明後日"
+        label_en = "Tomorrow" if delta == 1 else "Day After"
+        short_term.append({
+            "date":           d.get("date", dt.strftime("%Y-%m-%d")),
+            "date_label":     dt.strftime("%-m/%-d"),
+            "date_label_en":  dt.strftime("%b %-d"),
+            "label_ja":       label_ja,
+            "label_en":       label_en,
+            "hs_pct":         hs_pct,
+            "fe_pct":         fe_pct,
+            "jma_wave":       jma_waves.get(label_ja, ""),
+            "jma_prob":       jma_prob.get(label_ja, {}).get("level", ""),
+            "max_wave":       d.get("max_wave"),
+            "max_swell":      d.get("max_swell"),
+            "max_wind":       d.get("max_wind"),
         })
-        if d["max_wave"] is not None:
-            print(f"  {d['date']}: 波{d['max_wave']}m / 高速船{hs_pct}% / フェリー{fe_pct}%")
-    return result
+        if d.get("max_wave") is not None:
+            print(f"  {d.get('date', '')}: 波{d.get('max_wave')}m / 高速船{hs_pct}% / フェリー{fe_pct}%")
 
+    # --- long_term ---
+    lt_days = []
+    risk_dates = []
+    for delta in range(3, 8):
+        d  = day_list[delta] if delta < len(day_list) else {}
+        dt = now + timedelta(days=delta)
+        score = _calc_score(d.get("max_wave"), d.get("max_swell"), d.get("max_wind"))
+        if d.get("max_wave") is not None:
+            hs_pct = _score_to_pct_highspeed(score)
+            fe_pct = _score_to_pct_ferry(score)
+        else:
+            hs_pct = fe_pct = 1
+        lt_days.append({
+            "date":       d.get("date", dt.strftime("%Y-%m-%d")),
+            "date_label": dt.strftime("%-m/%-d"),
+            "hs_pct":     hs_pct,
+            "fe_pct":     fe_pct,
+        })
+        if max(hs_pct or 0, fe_pct or 0) >= 31:
+            risk_dates.append(dt)
 
-# ============================================================
-# 画像生成
-# ============================================================
+    max_lt_pct = max(
+        (max(d["hs_pct"] or 0, d["fe_pct"] or 0) for d in lt_days),
+        default=0
+    )
 
-def _fonts():
-    return {
-        "title":    _load_font(FONT_BOLD,    44),
-        "title_en": _load_font(FONT_MEDIUM,  24),
-        "head":     _load_font(FONT_BOLD,    32),
-        "head_en":  _load_font(FONT_REGULAR, 22),
-        "pct_big":  _load_font(FONT_BOLD,    86),
-        "pct_med":  _load_font(FONT_BOLD,    60),
-        "type_ja":  _load_font(FONT_MEDIUM,  28),
-        "date":     _load_font(FONT_MEDIUM,  34),
-        "date_en":  _load_font(FONT_REGULAR, 22),
-        "bar":      _load_font(FONT_REGULAR, 22),
-        "xs":       _load_font(FONT_REGULAR, 17),
-        "sec":      _load_font(FONT_BOLD,    22),
-        "val":      _load_font(FONT_MEDIUM,  20),
+    if risk_dates:
+        long_term = {
+            "has_risk":       True,
+            "risk_period":    f"{risk_dates[0].strftime('%-m/%-d')}〜{risk_dates[-1].strftime('%-m/%-d')}頃",
+            "risk_period_en": f"Around {risk_dates[0].strftime('%b %-d')} - {risk_dates[-1].strftime('%b %-d')}",
+            "max_pct":        max_lt_pct,
+            "days":           lt_days,
+        }
+    else:
+        if lt_days:
+            d0 = datetime.strptime(lt_days[0]["date"], "%Y-%m-%d")
+            d1 = datetime.strptime(lt_days[-1]["date"], "%Y-%m-%d")
+            lt_period_en = f"{d0.strftime('%b %-d')} - {d1.strftime('%b %-d')}"
+            lt_period_ja = f"{d0.strftime('%-m/%-d')}〜{d1.strftime('%-m/%-d')}"
+        else:
+            lt_period_en = lt_period_ja = ""
+        long_term = {
+            "has_risk":       False,
+            "risk_period":    "懸念なし",
+            "risk_period_en": "No concern",
+            "lt_period_ja":   lt_period_ja,
+            "lt_period_en":   lt_period_en,
+            "max_pct":        max_lt_pct,
+            "days":           lt_days,
+        }
+
+    # --- weather_data ---
+    tmr = short_term[0] if short_term else {}
+    weather_data = {
+        "jma_wave_tomorrow":  _fmt_wave(jma_waves.get("明日", "")),
+        "jma_wave_dayafter":  _fmt_wave(jma_waves.get("明後日", "")),
+        "jma_prob_tomorrow":  _fmt_prob(jma_prob.get("明日", {}).get("level", "")),
+        "jma_prob_dayafter":  _fmt_prob(jma_prob.get("明後日", {}).get("level", "")),
+        "num_max_wave":  f"{tmr.get('max_wave')}m"    if tmr.get("max_wave")  else "—",
+        "num_max_swell": f"{tmr.get('max_swell')}m"   if tmr.get("max_swell") else "—",
+        "num_max_wind":  f"{tmr.get('max_wind')} m/s" if tmr.get("max_wind")  else "—",
     }
 
+    return {
+        "short_term":          short_term,
+        "long_term":           long_term,
+        "weather_data":        weather_data,
+        "generated_at":        now.strftime("%Y/%m/%d %H:%M"),
+        "generated_at_label":  "8:15更新" if now.hour < 11 else "14:30更新",
+        "update_date_ja":      now.strftime("%-m/%-d"),
+        "update_date_en":      now.strftime("%b %-d"),
+    }
+
+
+# ============================================================
+# 画像生成（座間味と同じレイアウト）
+# ============================================================
 
 def make_image_short(forecast, output_path):
     """
     画像①: 短期予報
     明日 / 明後日 × 高速船（マリンライナー）/ フェリーとかしき
-    ferry-forecast の make_image_short と同じ2列構成。
+    座間味の make_image_short と同じ2列構成。フッターに JMA データを表示。
     """
-    now = datetime.now(JST)
-    DAY_JA  = ["（月）","（火）","（水）","（木）","（金）","（土）","（日）"]
-    DAY_EN  = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-
-    day1 = forecast[1] if len(forecast) > 1 else {}
-    day2 = forecast[2] if len(forecast) > 2 else {}
-
+    short = forecast["short_term"]
     max_pct = max(
-        (p for p in [day1.get("hs_pct"), day1.get("fe_pct"),
-                     day2.get("hs_pct"), day2.get("fe_pct")] if p is not None),
+        (p for d in short for p in [d.get("hs_pct"), d.get("fe_pct")] if p is not None),
         default=10
     )
     img  = Image.new("RGB", IMG_SIZE, color=_hex_to_rgb(_get_bg_color(max_pct)))
     draw = ImageDraw.Draw(img)
-    f    = _fonts()
+
+    f = {
+        "title_ja":  _load_font(FONT_BOLD,    44),
+        "title_en":  _load_font(FONT_MEDIUM,  28),
+        "date":      _load_font(FONT_MEDIUM,  34),
+        "date_en":   _load_font(FONT_REGULAR, 24),
+        "pct":       _load_font(FONT_BOLD,    86),
+        "type_ja":   _load_font(FONT_MEDIUM,  28),
+        "type_en":   _load_font(FONT_REGULAR, 20),
+        "jma":       _load_font(FONT_REGULAR, 17),
+        "xs":        _load_font(FONT_REGULAR, 17),
+    }
 
     # タイトル
     draw.text((540, 44),  "渡嘉敷航路 欠航リスク予報",
-              font=f["title"], fill="white", anchor="mm")
+              font=f["title_ja"], fill="white", anchor="mm")
     draw.text((540, 90),  "Tokashiki Route  /  Cancellation Risk Forecast",
               font=f["title_en"], fill=(255,255,255,210), anchor="mm")
-    draw.line([(80, 116), (1000, 116)], fill=(255,255,255,80), width=1)
+    draw.line([(80, 116), (1000, 116)], fill=(255,255,255,100), width=1)
 
-    # 2列（明日 / 明後日）
-    DIVIDER_Y       = 495
-    HS_TOP, HS_BTM  = 238, 492
-    FE_TOP, FE_BTM  = 498, 758
+    # レイアウト定数
+    HS_TOP, HS_BTM = 238, 492
+    FE_TOP, FE_BTM = 498, 758
+    DIVIDER_Y = 495
 
     positions = [270, 810]
-    days      = [day1, day2]
 
-    for i, (d, x) in enumerate(zip(days, positions)):
-        dt  = now + timedelta(days=i + 1)
-        label_ja = "明日" if i == 0 else "明後日"
-        label_en = "Tomorrow" if i == 0 else "Day After"
-        date_ja  = f"{dt.month}/{dt.day}{DAY_JA[dt.weekday()]}"
-        date_en  = f"{label_en}  {dt.strftime('%b')} {dt.day} ({DAY_EN[dt.weekday()]})"
-        px1, px2 = x - 222, x + 222
+    for i, day in enumerate(short[:2]):
+        x   = positions[i]
+        px1 = x - 222
 
-        hs_pct = d.get("hs_pct")
-        fe_pct = d.get("fe_pct")
+        hs_pct = day.get("hs_pct")
+        fe_pct = day.get("fe_pct")
 
-        draw.text((x, 168), f"{label_ja}  {date_ja}",
+        # 日付ヘッダー
+        draw.text((x, 168), f"{day['label_ja']}  {day['date_label']}",
                   font=f["date"], fill="white", anchor="mm")
-        draw.text((x, 208), date_en,
+        draw.text((x, 208), f"{day['label_en']}  {day.get('date_label_en', '')}",
                   font=f["date_en"], fill=(255,255,255,180), anchor="mm")
 
         # 高速船セクション
         hs_mid = (HS_TOP + HS_BTM) // 2
         if hs_pct is not None:
             draw.text((x, hs_mid - 52), f"{hs_pct}%",
-                      font=f["pct_big"], fill="white", anchor="mm")
+                      font=f["pct"], fill="white", anchor="mm")
         else:
             draw.text((x, hs_mid - 20), "—",
-                      font=f["pct_med"], fill=(200,200,200), anchor="mm")
+                      font=_load_font(FONT_BOLD, 60), fill=(200,200,200), anchor="mm")
         draw.text((x, hs_mid + 22), "マリンライナーとかしき",
                   font=f["type_ja"], fill=(255,255,255,220), anchor="mm")
         draw.text((x, hs_mid + 52), "Marine Liner Tokashiki",
-                  font=_load_font(FONT_REGULAR, 20), fill=(255,255,255,175), anchor="mm")
+                  font=f["type_en"], fill=(255,255,255,175), anchor="mm")
 
         # 区切り線
-        draw.line([(px1 + 10, DIVIDER_Y), (px2 - 10, DIVIDER_Y)],
+        draw.line([(px1 + 10, DIVIDER_Y), (x + 222 - 10, DIVIDER_Y)],
                   fill=(255,255,255,70), width=1)
 
-        # フェリーセクション
+        # フェリーセクション（JMA データを下部に表示）
         fe_mid = (FE_TOP + FE_BTM) // 2
         if fe_pct is not None:
-            draw.text((x, fe_mid - 46), f"{fe_pct}%",
-                      font=f["pct_big"], fill="white", anchor="mm")
+            draw.text((x, fe_mid - 52), f"{fe_pct}%",
+                      font=f["pct"], fill="white", anchor="mm")
         else:
             draw.text((x, fe_mid - 20), "—",
-                      font=f["pct_med"], fill=(200,200,200), anchor="mm")
-        draw.text((x, fe_mid + 26), "フェリーとかしき",
+                      font=_load_font(FONT_BOLD, 60), fill=(200,200,200), anchor="mm")
+        draw.text((x, fe_mid + 20), "フェリーとかしき",
                   font=f["type_ja"], fill=(255,255,255,220), anchor="mm")
-        draw.text((x, fe_mid + 56), "Ferry Tokashiki",
-                  font=_load_font(FONT_REGULAR, 20), fill=(255,255,255,175), anchor="mm")
+        draw.text((x, fe_mid + 50), "Ferry Tokashiki",
+                  font=f["type_en"], fill=(255,255,255,175), anchor="mm")
+        # JMA データ（フェリーセクション下部）
+        if day.get("jma_wave"):
+            draw.text((x, fe_mid + 80),
+                      f"気象庁: {day['jma_wave']}",
+                      font=f["jma"], fill=(255,255,255,155), anchor="mm")
+        if day.get("jma_prob"):
+            draw.text((x, fe_mid + 100),
+                      f"早期注意(波浪): {day['jma_prob']}",
+                      font=f["jma"], fill=(255,255,255,155), anchor="mm")
 
+    # 中央縦線・フッター
     draw.line([(540, 116), (540, 758)], fill=(255,255,255,55), width=1)
     draw.line([(80, 768), (1000, 768)], fill=(255,255,255,45), width=1)
     draw.text((540, 802), "※AI予測・参考値。運休は公式発表に基づきます。",
@@ -362,149 +529,176 @@ def make_image_short(forecast, output_path):
 
 
 def make_image_longterm(forecast, output_path):
-    """画像②: 長期予報（3〜7日先・棒グラフ）"""
-    now = datetime.now(JST)
-    DAY_JA = ["月","火","水","木","金","土","日"]
-
-    lt_days = []
-    for delta in range(3, 8):
-        d = forecast[delta] if delta < len(forecast) else {}
-        lt_days.append({
-            "date":  (now + timedelta(days=delta)).strftime("%Y-%m-%d"),
-            "label": f"{(now + timedelta(days=delta)).month}/{(now + timedelta(days=delta)).day}"
-                     f"({DAY_JA[(now + timedelta(days=delta)).weekday()]})",
-            "hs_pct": d.get("hs_pct"),
-            "fe_pct": d.get("fe_pct"),
-        })
-
-    max_pct = max(
-        (p for d in lt_days for p in [d["hs_pct"], d["fe_pct"]] if p is not None),
-        default=0
-    )
+    """
+    画像②: 長期予報（3〜7日先）
+    座間味と同じレイアウト: リスク期間+最大% → 白棒グラフ2列
+    """
+    lt = forecast["long_term"]
+    max_pct = lt["max_pct"]
     img  = Image.new("RGB", IMG_SIZE, color=_hex_to_rgb(_get_bg_color(max_pct)))
     draw = ImageDraw.Draw(img)
-    f    = _fonts()
 
-    draw.text((540, 44),  "長期予報（3〜7日先）",
-              font=f["title"], fill="white", anchor="mm")
-    draw.text((540, 88),  "Tokashiki Route  /  Long-term Risk Forecast  (3-7 days ahead)",
+    f = {
+        "title_ja": _load_font(FONT_BOLD,    44),
+        "title_en": _load_font(FONT_MEDIUM,  26),
+        "island":   _load_font(FONT_REGULAR, 22),
+        "head":     _load_font(FONT_MEDIUM,  32),
+        "head_en":  _load_font(FONT_REGULAR, 24),
+        "period":   _load_font(FONT_BOLD,    64),
+        "pct":      _load_font(FONT_BOLD,    76),
+        "label":    _load_font(FONT_MEDIUM,  28),
+        "label_en": _load_font(FONT_REGULAR, 22),
+        "col_hd":   _load_font(FONT_MEDIUM,  22),
+        "bar":      _load_font(FONT_REGULAR, 21),
+        "badge":    _load_font(FONT_BOLD,    18),
+        "xs":       _load_font(FONT_REGULAR, 17),
+    }
+
+    # タイトル
+    draw.text((540, 46),  "フェリー欠航可能性 長期予報（3〜7日先）",
+              font=f["title_ja"], fill="white", anchor="mm")
+    draw.text((540, 86),  "Ferry Cancellation Risk  /  Long-term Forecast (3-7 days ahead)",
               font=f["title_en"], fill=(255,255,255,200), anchor="mm")
-    draw.line([(60, 110), (1020, 110)], fill=(255,255,255,80), width=1)
+    draw.text((540, 112), "渡嘉敷島  Tokashiki Island",
+              font=f["island"], fill=(255,255,255,160), anchor="mm")
+    draw.line([(80, 128), (1000, 128)], fill=(255,255,255,100), width=1)
 
-    if max_pct >= 30:
-        risk_days  = [d["label"] for d in lt_days
-                      if (d["hs_pct"] or 0) >= 30 or (d["fe_pct"] or 0) >= 30]
-        period_str = "  ".join(risk_days) if risk_days else "—"
-        draw.text((540, 158), "注意が必要な期間  /  Risk Period",
+    if lt["has_risk"]:
+        # リスク期間・最大%
+        draw.text((540, 183), "欠航リスク期間  /  Risk Period",
                   font=f["head"], fill=(255,255,255,200), anchor="mm")
-        draw.text((540, 228), period_str,
-                  font=_load_font(FONT_BOLD, 26), fill="white", anchor="mm")
-        draw.text((540, 284), f"最大欠航リスク  Max:  高速船 {max(d['hs_pct'] or 0 for d in lt_days)}%  "
-                  f"フェリー {max(d['fe_pct'] or 0 for d in lt_days)}%",
-                  font=f["head_en"], fill=(255,255,255,190), anchor="mm")
+        draw.text((540, 255), lt["risk_period"],
+                  font=f["period"], fill="white", anchor="mm")
+        draw.text((540, 308), lt["risk_period_en"],
+                  font=f["head_en"], fill=(255,255,255,180), anchor="mm")
+        draw.line([(80, 328), (1000, 328)], fill=(255,255,255,70), width=1)
+
+        # 高速船・フェリー最大%
+        hs_max = max((d["hs_pct"] for d in lt["days"]), default=None)
+        fe_max = max((d["fe_pct"] for d in lt["days"]), default=None)
+        for x, pct, lja, len_ in [
+            (270, hs_max, "高速船", "Marine Liner"),
+            (810, fe_max, "フェリー", "Ferry"),
+        ]:
+            draw.text((x, 362), lja, font=f["label"], fill=(255,255,255,200), anchor="mm")
+            draw.text((x, 388), len_, font=f["label_en"], fill=(255,255,255,170), anchor="mm")
+            if pct is not None:
+                draw.text((x, 453), f"{pct}%", font=f["pct"], fill="white", anchor="mm")
+                draw.text((x, 500), "最大欠航可能性 / Max Risk",
+                          font=f["label_en"], fill=(255,255,255,160), anchor="mm")
+        draw.line([(540, 333), (540, 520)], fill=(255,255,255,60), width=1)
     else:
-        draw.text((540, 220), "懸念なし  /  No Significant Risk",
-                  font=f["head"], fill="white", anchor="mm")
+        draw.text((540, 300), "懸念なし  /  No Significant Risk",
+                  font=f["period"], fill="white", anchor="mm")
 
-    draw.line([(60, 318), (1020, 318)], fill=(255,255,255,60), width=1)
+    # 2列横棒グラフ
+    FOOTER_LINE_Y = 960
+    draw.line([(80, 530), (1000, 530)], fill=(255,255,255,70), width=1)
+    draw.text((290, 552), "高速船  Marine Liner", font=f["col_hd"], fill="white", anchor="mm")
+    draw.text((790, 552), "フェリー  Ferry",      font=f["col_hd"], fill="white", anchor="mm")
 
-    # 2列棒グラフ（高速船 / フェリー）
-    draw.text((290, 340), "高速船  Marine Liner", font=f["head_en"], fill="white", anchor="mm")
-    draw.text((790, 340), "フェリー  Ferry",      font=f["head_en"], fill="white", anchor="mm")
-
-    BAR_TOP = 375
-    BAR_H   = 36
-    ROW_SP  = 90
-    cols    = [
-        {"date_x": 80,  "bar_x": 100, "bar_max": 290, "pct_x": 400, "key": "hs_pct"},
-        {"date_x": 545, "bar_x": 565, "bar_max": 290, "pct_x": 865, "key": "fe_pct"},
+    bar_top, bar_h, row_sp = 580, 28, 72
+    cols = [
+        {"date_x": 155, "bar_x": 175, "bar_max": 270, "pct_x": 455, "key": "hs_pct"},
+        {"date_x": 595, "bar_x": 615, "bar_max": 270, "pct_x": 895, "key": "fe_pct"},
     ]
-
-    for i, d in enumerate(lt_days):
-        y = BAR_TOP + i * ROW_SP
+    for i, d in enumerate(lt["days"][:5]):
+        y     = bar_top + i * row_sp
+        label = d["date_label"]
         for col in cols:
             pct   = d[col["key"]] or 0
             bar_w = int(col["bar_max"] * pct / 100)
-            draw.text((col["date_x"], y + BAR_H // 2), d["label"],
+            draw.text((col["date_x"], y + bar_h // 2), label,
                       font=f["bar"], fill="white", anchor="rm")
-            draw.rectangle([(col["bar_x"], y), (col["bar_x"] + col["bar_max"], y + BAR_H)],
-                           fill=(0,0,0,55))
+            draw.rectangle([(col["bar_x"], y), (col["bar_x"] + col["bar_max"], y + bar_h)],
+                           fill=(0, 0, 0, 50))
             if bar_w > 0:
-                bc = tuple(min(255, int(c * 1.35)) for c in _hex_to_rgb(_get_bg_color(pct)))
-                draw.rectangle([(col["bar_x"], y), (col["bar_x"] + bar_w, y + BAR_H)], fill=bc)
-            pct_str = f"{pct}%" if d[col["key"]] is not None else "—"
-            draw.text((col["pct_x"], y + BAR_H // 2), pct_str,
-                      font=f["bar"], fill=_get_risk_text_color(pct), anchor="lm")
+                draw.rectangle([(col["bar_x"], y), (col["bar_x"] + bar_w, y + bar_h)],
+                               fill=(255, 255, 255, 210))
+            draw.text((col["pct_x"], y + bar_h // 2), f"{pct}%",
+                      font=f["bar"], fill="white", anchor="lm")
 
-    draw.line([(60, 920), (1020, 920)], fill=(255,255,255,50), width=1)
-    draw.text((540, 950), "※AI予測・参考値。欠航判断は公式発表に基づきます。",
+    draw.line([(540, 535), (540, FOOTER_LINE_Y)], fill=(255,255,255,50), width=1)
+    draw.line([(80, FOOTER_LINE_Y), (1000, FOOTER_LINE_Y)], fill=(255,255,255,40), width=1)
+    draw.text((540, 985), "※AI予測・参考値。公式情報は渡嘉敷村HPをご確認ください。",
               font=f["xs"], fill=(255,255,255,140), anchor="mm")
-    draw.text((540, 972), "*AI estimates only. Check official announcements for cancellations.",
-              font=f["xs"], fill=(255,255,255,110), anchor="mm")
+    draw.text((540, 1006), "*AI-based estimate. Check official Tokashiki Village website.",
+              font=f["xs"], fill=(255,255,255,120), anchor="mm")
 
     img.save(output_path)
     print(f"  画像②保存: {output_path}")
 
 
 def make_image_weatherdata(forecast, output_path):
-    """画像③: 根拠データ（明日・明後日の気象数値）"""
-    now = datetime.now(JST)
+    """
+    画像③: 予報根拠データ（座間味と同じ3セクション構成）
+    JMA / 数値予測 / 情報源
+    """
+    wd   = forecast.get("weather_data", {})
     img  = Image.new("RGB", IMG_SIZE, color=_hex_to_rgb("#0A1628"))
     draw = ImageDraw.Draw(img)
-    f    = _fonts()
 
-    draw.text((540, 56),  "予報根拠データ  /  Forecast Data",
+    f = {
+        "title":    _load_font(FONT_BOLD,    40),
+        "sec_hd":   _load_font(FONT_BOLD,    22),
+        "label_ja": _load_font(FONT_REGULAR, 20),
+        "label_en": _load_font(FONT_REGULAR, 17),
+        "value":    _load_font(FONT_MEDIUM,  20),
+        "src":      _load_font(FONT_REGULAR, 19),
+        "foot":     _load_font(FONT_REGULAR, 17),
+    }
+
+    # タイトル
+    draw.text((540, 68), "予報根拠データ  /  Forecast Data",
               font=f["title"], fill="white", anchor="mm")
-    draw.line([(60, 90), (1020, 90)], fill="#334E7A", width=2)
+    draw.line([(60, 100), (1020, 100)], fill="#334E7A", width=2)
 
     def section_header(y, ja, en):
         draw.rectangle([(60, y), (1020, y + 44)], fill="#1A3057")
-        draw.text((80, y + 22), f"【{ja} / {en}】", font=f["sec"], fill="#7EB3F5", anchor="lm")
+        draw.text((80, y + 22), f"【{ja} / {en}】",
+                  font=f["sec_hd"], fill="#7EB3F5", anchor="lm")
         return y + 60
 
-    def row(y, label_ja, label_en, value):
-        draw.text((80,  y),     label_ja,  font=_load_font(FONT_REGULAR, 20), fill="#BBDEFB", anchor="lm")
-        draw.text((96,  y+24),  label_en,  font=_load_font(FONT_REGULAR, 17), fill="#7986CB", anchor="lm")
-        draw.text((1010, y+12), str(value), font=_load_font(FONT_MEDIUM, 20),  fill="white",   anchor="rm")
-        return y + 56
+    def row(y, icon, label_ja, label_en, value):
+        draw.text((80,  y),     f"{icon} {label_ja}", font=f["label_ja"], fill="#BBDEFB", anchor="lm")
+        draw.text((96,  y + 24), label_en,             font=f["label_en"], fill="#7986CB", anchor="lm")
+        draw.text((1010, y + 12), str(value),           font=f["value"],    fill="white",   anchor="rm")
+        return y + 58
 
-    def _fmt(v, unit=""): return f"{v:.1f}{unit}" if v is not None else "—"
+    y = 112
 
-    y = 104
+    # 【気象庁 / JMA】
+    y = section_header(y, "気象庁", "JMA")
+    y = row(y, "🌊", "波高予報（明日）",           "Wave Height Forecast (Tomorrow)",  wd.get("jma_wave_tomorrow", "—"))
+    y = row(y, "🌊", "波高予報（明後日）",          "Wave Height Forecast (Day After)", wd.get("jma_wave_dayafter", "—"))
+    y = row(y, "⚠",  "早期注意情報・波浪（明日）",  "Early Warning Wave (Tomorrow)",    wd.get("jma_prob_tomorrow", "なし / None"))
+    y = row(y, "⚠",  "早期注意情報・波浪（明後日）", "Early Warning Wave (Day After)",   wd.get("jma_prob_dayafter", "なし / None"))
 
-    for delta in [1, 2]:
-        d  = forecast[delta] if delta < len(forecast) else {}
-        dt = now + timedelta(days=delta)
-        DAY_JA = ["月","火","水","木","金","土","日"]
-        label_ja = "明日" if delta == 1 else "明後日"
-        label_en = "Tomorrow" if delta == 1 else "Day After"
+    y += 12
 
-        y = section_header(y, f"{label_ja} {dt.month}/{dt.day}({DAY_JA[dt.weekday()]})",
-                           f"{label_en} {dt.strftime('%b %-d')}")
-        y = row(y, "最大波高",  "Max Wave Height",         _fmt(d.get("max_wave"),  " m"))
-        y = row(y, "最大うねり", "Max Swell Height",        _fmt(d.get("max_swell"), " m"))
-        y = row(y, "最大風速",  "Max Wind Speed",           _fmt(d.get("max_wind"),  " m/s"))
+    # 【数値予測 / Numerical Model】
+    y = section_header(y, "数値予測", "Numerical Model")
+    y = row(y, "📊", "明日 最大波高",   "Tomorrow Max Wave Height",  wd.get("num_max_wave",  "—"))
+    y = row(y, "📊", "明日 最大うねり", "Tomorrow Max Swell Height", wd.get("num_max_swell", "—"))
+    y = row(y, "💨", "明日 最大風速",   "Tomorrow Max Wind Speed",   wd.get("num_max_wind",  "—"))
 
-        hs_pct = d.get("hs_pct")
-        fe_pct = d.get("fe_pct")
-        y = row(y, "高速船 欠航リスク", "Marine Liner Cancel Risk",
-                f"{hs_pct}%" if hs_pct is not None else "—")
-        y = row(y, "フェリー 欠航リスク", "Ferry Cancel Risk",
-                f"{fe_pct}%" if fe_pct is not None else "—")
-        y += 12
+    y += 12
 
-    y += 8
-    draw.line([(60, y), (1020, y)], fill="#334E7A", width=1)
-    draw.rectangle([(60, y + 8), (1020, y + 52)], fill="#1A3057")
-    draw.text((80, y + 30), "【情報源】  Open-Meteo Marine API  /  渡嘉敷フェリーポータル tokashiki-ferry.jp",
-              font=_load_font(FONT_REGULAR, 17), fill="#7EB3F5", anchor="lm")
+    # 【情報源 / Sources】
+    y = section_header(y, "情報源", "Sources")
+    draw.text((80, y),      "気象庁（jma.go.jp）  /  Open-Meteo Marine API",
+              font=f["src"], fill="#BBDEFB", anchor="lm")
+    draw.text((80, y + 30), "渡嘉敷村HP（vill.tokashiki.okinawa.jp）",
+              font=f["src"], fill="#BBDEFB", anchor="lm")
+    draw.text((80, y + 60), "Tokashiki Village official site / JMA (jma.go.jp)",
+              font=f["src"], fill="#7986CB", anchor="lm")
 
-    footer_y = y + 72
-    draw.line([(60, footer_y), (1020, footer_y)], fill="#334E7A", width=1)
-    draw.text((540, footer_y + 20), "※欠航判断は村営渡嘉敷村フェリー運航会社が行います。AI参考値。",
-              font=_load_font(FONT_REGULAR, 16), fill="#546E7A", anchor="mm")
-    draw.text((540, footer_y + 42), f"生成: {now.strftime('%Y-%m-%d %H:%M')} JST",
-              font=_load_font(FONT_REGULAR, 16), fill="#37474F", anchor="mm")
+    # フッター
+    draw.line([(60, 1020), (1020, 1020)], fill="#334E7A", width=1)
+    draw.text((540, 1044), "※欠航判断は船会社・渡嘉敷村が行います。本データはAI予測の参考値です。",
+              font=f["foot"], fill="#546E7A", anchor="mm")
+    draw.text((540, 1066), "*Cancellation is determined by ferry operators. AI-based estimates for reference only.",
+              font=f["foot"], fill="#455A64", anchor="mm")
 
     img.save(output_path)
     print(f"  画像③保存: {output_path}")
@@ -611,35 +805,108 @@ def _post_to_instagram(image_urls, caption):
         return False
 
 
+# ============================================================
+# キャプション生成（座間味と同じ6段階コメント）
+# ============================================================
+
 def _build_caption(forecast, now):
-    tmr    = now + timedelta(days=1)
-    DAY_JA = ["月","火","水","木","金","土","日"]
-    DAY_EN = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    MON_EN = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-    d1     = forecast[1] if len(forecast) > 1 else {}
-    lines  = [
-        f"🚢 渡嘉敷航路 欠航リスク予報  {tmr.month}/{tmr.day}({DAY_JA[tmr.weekday()]})",
-        f"🚢 Tokashiki Route  Cancellation Risk  {MON_EN[tmr.month-1]} {tmr.day} ({DAY_EN[tmr.weekday()]})",
-        "",
-    ]
-    hs_pct = d1.get("hs_pct")
-    fe_pct = d1.get("fe_pct")
-    if hs_pct is not None:
-        icon = "🔴" if hs_pct >= 70 else ("🟡" if hs_pct >= 40 else "🟢")
-        lines.append(f"{icon} マリンライナーとかしき / Marine Liner Tokashiki: {hs_pct}%")
-    if fe_pct is not None:
-        icon = "🔴" if fe_pct >= 70 else ("🟡" if fe_pct >= 40 else "🟢")
-        lines.append(f"{icon} フェリーとかしき / Ferry Tokashiki: {fe_pct}%")
-    lines += [
-        "",
-        "📊 詳細は画像スワイプでご確認ください。/ Swipe for details.",
-        "⚠️ AI予測・参考値。欠航判断は公式HPをご確認ください。",
-        "⚠️ AI estimates only. Check official site for cancellations.",
-        "",
-        "#渡嘉敷島 #渡嘉敷 #慶良間諸島 #沖縄離島 #欠航予報",
-        "#Tokashiki #KeramaIslands #OkinawaFerry #JapanTravel",
-    ]
-    return "\n".join(lines)
+    short = forecast["short_term"]
+    lt    = forecast["long_term"]
+    s0    = short[0] if short else {}
+    s1    = short[1] if len(short) > 1 else {}
+
+    # 長期期間の表記
+    if lt["has_risk"]:
+        lt_period_ja = lt["risk_period"]
+        lt_period_en = lt["risk_period_en"]
+    else:
+        if lt.get("days"):
+            d0 = datetime.strptime(lt["days"][0]["date"], "%Y-%m-%d")
+            d1 = datetime.strptime(lt["days"][-1]["date"], "%Y-%m-%d")
+            lt_period_ja = f"{d0.strftime('%-m/%-d')}〜{d1.strftime('%-m/%-d')}"
+            lt_period_en = f"{d0.strftime('%b %-d')} - {d1.strftime('%b %-d')}"
+        else:
+            lt_period_ja = lt.get("lt_period_ja", "")
+            lt_period_en = lt.get("lt_period_en", "")
+
+    # リスクティア判定（短期最大値）
+    max_pct = max(
+        s0.get("hs_pct") or 0, s0.get("fe_pct") or 0,
+        s1.get("hs_pct") or 0, s1.get("fe_pct") or 0,
+    )
+
+    if max_pct <= 10 and not lt["has_risk"]:
+        comment_ja = (
+            "\n🟢 今週は全日程で欠航リスク極めて低め！\n"
+            "島滞在中の方も、これから渡航予定の方も安心してプランを組めそうです。\n"
+        )
+        comment_en = "\n🟢 Low cancellation risk all week — great time to visit!\n"
+    elif max_pct <= 30 and not lt["has_risk"]:
+        comment_ja = (
+            "\n🟢 欠航リスクは低い見込みです。\n"
+            "出発前に最新の予報をご確認ください。\n"
+        )
+        comment_en = "\n🟢 Cancellation risk looks low. Check the forecast before departure.\n"
+    elif max_pct <= 30 and lt["has_risk"]:
+        comment_ja = (
+            "\n🟡 短期は問題なし。ただし来週以降に荒れる可能性があります。\n"
+            "引き続き予報をチェックしていきましょう。\n"
+        )
+        comment_en = "\n🟡 Short-term looks fine, but rougher conditions may develop next week. Keep an eye on forecasts.\n"
+    elif max_pct <= 60:
+        comment_ja = (
+            "\n🟡 現時点では運航見込みですが、想定より荒天が進めば欠航リスクが出てきます。\n"
+            "最新情報をご確認ください。\n"
+        )
+        comment_en = "\n🟡 Currently operating, but cancellations may occur if conditions worsen. Check latest info.\n"
+    elif max_pct <= 80:
+        comment_ja = (
+            "\n🔴 高速船の欠航リスクが高い状況です。\n"
+            "旅程は余裕をもって組んでおくことをおすすめします。最新情報は渡嘉敷村HPへ。\n"
+        )
+        comment_en = "\n🔴 High cancellation risk. Consider scheduling with some flexibility. Check Tokashiki Village website.\n"
+    else:
+        comment_ja = (
+            "\n🚨 欠航可能性が非常に高い状況です。\n"
+            "島内滞在中の方は帰島日の前倒しをご検討ください。渡航予定の方は旅程変更も選択肢に。\n"
+        )
+        comment_en = "\n🚨 Very high cancellation risk. Guests on the island should consider an earlier return. Those planning to visit may want to reconsider.\n"
+
+    hs0 = s0.get("hs_pct", "—"); fe0 = s0.get("fe_pct", "—")
+    hs1 = s1.get("hs_pct", "—"); fe1 = s1.get("fe_pct", "—")
+    dl0 = s0.get("date_label", ""); dl1 = s1.get("date_label", "")
+    dl0_en = s0.get("date_label_en", ""); dl1_en = s1.get("date_label_en", "")
+
+    ig_caption = (
+        f"{forecast['update_date_ja']} {forecast['generated_at_label']}\n"
+        f"渡嘉敷航路 欠航リスク予報\n"
+        f"\n"
+        f"■欠航可能性\n"
+        f"明日 {dl0}  高速船 {hs0}% / フェリー {fe0}%\n"
+        f"明後日 {dl1} 高速船 {hs1}% / フェリー {fe1}%\n"
+        f"長期（{lt_period_ja}）: {lt['risk_period'] if lt['has_risk'] else '懸念なし'} "
+        f"最大{lt['max_pct']}%\n"
+        + comment_ja
+        + "⚠️ AI予測・参考値です。公式情報は渡嘉敷村フェリー公式HPを参照ください。\n"
+        + "#渡嘉敷島 #渡嘉敷 #慶良間諸島 #沖縄離島 #欠航予報\n"
+        + "\n"
+        + "\n"
+        + f"{forecast['update_date_en']} updated\n"
+        + "Tokashiki Route  Cancellation Risk Forecast\n"
+        + "\n"
+        + "■Boat/Ferry Cancellation Risk\n"
+        + f"Tomorrow ({dl0_en}) Marine Liner {hs0}% / Ferry {fe0}%\n"
+        + f"Day After ({dl1_en}) Marine Liner {hs1}% / Ferry {fe1}%\n"
+        + f"Long-term ({lt_period_en}): "
+        + f"{'No Significant Risk' if not lt['has_risk'] else lt['risk_period_en']}, "
+        + f"max.{lt['max_pct']}%\n"
+        + comment_en
+        + "⚠️ AI-based estimate, for reference only\n"
+        + "Check official Tokashiki Village website for confirmed info\n"
+        + "\n"
+        + "#KeramaIslands #Tokashiki #OkinawaFerry #JapanTravel"
+    )
+    return ig_caption
 
 
 # ============================================================
@@ -661,14 +928,21 @@ def run_tokashiki_publisher(weather=None):
     day_list = _fetch_forecast(days=8)
 
     # Day1 はロガー取得済みデータで上書き（精度優先・API節約）
-    if weather:
-        if len(day_list) > 1:
-            d = day_list[1]
-            d["max_wave"]  = weather.get("tmr_max_wave")  or d["max_wave"]
-            d["max_swell"] = weather.get("tmr_max_swell") or d["max_swell"]
-            d["max_wind"]  = weather.get("tmr_max_wind")  or d["max_wind"]
+    if weather and len(day_list) > 1:
+        d = day_list[1]
+        d["max_wave"]  = weather.get("tmr_max_wave")  or d["max_wave"]
+        d["max_swell"] = weather.get("tmr_max_swell") or d["max_swell"]
+        d["max_wind"]  = weather.get("tmr_max_wind")  or d["max_wind"]
 
-    forecast = _build_forecast(day_list)
+    # [P1b] JMA データ取得
+    print("\n[P1b] JMAデータ取得中...")
+    jma_waves = _get_jma_forecast_waves()
+    jma_prob  = _get_jma_probability()
+    print(f"  JMA波浪: {jma_waves}")
+    print(f"  JMA確率: {jma_prob}")
+
+    # [P1c] 構造化予報データ構築
+    forecast = _build_forecast_data(day_list, jma_waves=jma_waves, jma_prob=jma_prob)
 
     # [P2] 画像生成
     print("\n[P2] 画像生成中...")
