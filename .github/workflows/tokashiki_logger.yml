@@ -3,6 +3,7 @@ name: Tokashiki Ferry Logger
 on:
   schedule:
     - cron: '15 23 * * *'   # 08:15 JST（UTC 23:15 前日）
+    - cron: '30 5 * * *'    # 14:30 JST（UTC 05:30）
   workflow_dispatch:         # 手動実行も可能
 
 permissions:
