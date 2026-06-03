@@ -978,6 +978,23 @@ def run_tokashiki_publisher(weather=None):
 
     # [P4] Instagram 投稿
     caption = _build_caption(forecast, now)
+
+    # 午後便（12時以降）は欠航リスクが高い場合のみInstagram投稿（座間味と同じロジック）
+    # 条件: 明日 or 明後日の高速船 or フェリー欠航確率 61% 以上
+    is_afternoon_run = now.hour >= 12
+    if is_afternoon_run:
+        short = forecast.get("short_term", [])
+        max_pct = max(
+            (d.get(k) or 0)
+            for d in short[:2]
+            for k in ["hs_pct", "fe_pct"]
+        )
+        if max_pct < 61:
+            print(f"  [午後便] 欠航リスク最大 {max_pct}% < 61% → Instagram投稿スキップ")
+            print("\n✅ Tokashiki Publisher 完了")
+            return
+        print(f"  [午後便] 欠航リスク最大 {max_pct}% ≥ 61% → Instagram投稿実行")
+
     print(f"\n[P4] Instagram 投稿中...")
     _post_to_instagram(image_urls, caption)
 
