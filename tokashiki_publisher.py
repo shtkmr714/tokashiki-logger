@@ -117,16 +117,33 @@ def _hex_to_rgb(h):
 # リスクスコア計算（座間味と同じ式）
 # ============================================================
 
-def _calc_score(wave, swell, wind, has_warning=False):
-    """0〜1 のスコアを返す。None は 0 扱い。"""
-    wave_score    = min((wave  or 0) / 5.0,  1.0)
-    swell_score   = min((swell or 0) / 4.0,  1.0)
-    wind_score    = min((wind  or 0) / 20.0, 1.0)
+def _calc_score(wave, swell, wind, has_warning=False,
+                swell_period=None, gust=None):
+    """
+    0〜1 のスコアを返す。座間味（ferry_alert.py）と完全に同じ式。
+    - うねり周期補正: 8秒超で最大1.3倍
+    - 突風補正: 平均風速と突風（25m/s正規化）の大きい方を採用
+    """
+    wave_score  = min((wave  or 0) / 5.0,  1.0)
+    swell_score = min((swell or 0) / 4.0,  1.0)
+
+    # うねり周期補正（長周期うねりは実害が大きい）
+    if swell_period and swell:
+        factor = 1.0 + max(0.0, swell_period - 8.0) * 0.0375
+        swell_score = min(swell_score * min(factor, 1.3), 1.0)
+
+    wind_score  = min((wind  or 0) / 20.0, 1.0)
+    # 突風補正（瞬間風速が高い場合は突風ベースで評価）
+    if gust:
+        wind_score = max(wind_score, min(gust / 25.0, 1.0))
+
     warning_score = 1.0 if has_warning else 0.0
-    return (wave_score  * SCORE_WEIGHTS["wave"]    +
-            swell_score * SCORE_WEIGHTS["swell"]   +
-            wind_score  * SCORE_WEIGHTS["wind"]    +
-            warning_score * SCORE_WEIGHTS["warning"])
+    return round(
+        wave_score  * SCORE_WEIGHTS["wave"]    +
+        swell_score * SCORE_WEIGHTS["swell"]   +
+        wind_score  * SCORE_WEIGHTS["wind"]    +
+        warning_score * SCORE_WEIGHTS["warning"], 3
+    )
 
 
 def _score_to_pct_highspeed(score):
@@ -252,13 +269,13 @@ def _fetch_forecast(days=8, timeout=30, max_retries=3):
     marine_url = (
         f"https://marine-api.open-meteo.com/v1/marine"
         f"?latitude={lats}&longitude={lons}"
-        f"&hourly=wave_height,swell_wave_height"
+        f"&hourly=wave_height,swell_wave_height,swell_wave_period"
         f"&timezone=Asia%2FTokyo&forecast_days={days}"
     )
     weather_url = (
         f"https://api.open-meteo.com/v1/forecast"
         f"?latitude={lats}&longitude={lons}"
-        f"&hourly=wind_speed_10m&wind_speed_unit=ms"
+        f"&hourly=wind_speed_10m,wind_gusts_10m&wind_speed_unit=ms"
         f"&timezone=Asia%2FTokyo&forecast_days={days}"
     )
 
@@ -293,10 +310,12 @@ def _fetch_forecast(days=8, timeout=30, max_retries=3):
             return round(best, 2) if best is not None else None
 
         day_list.append({
-            "date":      target,
-            "max_wave":  _worst(marine_locs,  "wave_height"),
-            "max_swell": _worst(marine_locs,  "swell_wave_height"),
-            "max_wind":  _worst(weather_locs, "wind_speed_10m"),
+            "date":             target,
+            "max_wave":         _worst(marine_locs,  "wave_height"),
+            "max_swell":        _worst(marine_locs,  "swell_wave_height"),
+            "max_swell_period": _worst(marine_locs,  "swell_wave_period"),
+            "max_wind":         _worst(weather_locs, "wind_speed_10m"),
+            "max_gust":         _worst(weather_locs, "wind_gusts_10m"),
         })
 
     return day_list
@@ -320,7 +339,8 @@ def _build_forecast_data(day_list, jma_waves=None, jma_prob=None):
     for delta in [1, 2]:
         d     = day_list[delta] if delta < len(day_list) else {}
         dt    = now + timedelta(days=delta)
-        score = _calc_score(d.get("max_wave"), d.get("max_swell"), d.get("max_wind"))
+        score = _calc_score(d.get("max_wave"), d.get("max_swell"), d.get("max_wind"),
+                            swell_period=d.get("max_swell_period"), gust=d.get("max_gust"))
         if d.get("max_wave") is not None:
             hs_pct = _score_to_pct_highspeed(score)
             fe_pct = _score_to_pct_ferry(score)
@@ -351,7 +371,8 @@ def _build_forecast_data(day_list, jma_waves=None, jma_prob=None):
     for delta in range(3, 8):
         d  = day_list[delta] if delta < len(day_list) else {}
         dt = now + timedelta(days=delta)
-        score = _calc_score(d.get("max_wave"), d.get("max_swell"), d.get("max_wind"))
+        score = _calc_score(d.get("max_wave"), d.get("max_swell"), d.get("max_wind"),
+                            swell_period=d.get("max_swell_period"), gust=d.get("max_gust"))
         if d.get("max_wave") is not None:
             hs_pct = _score_to_pct_highspeed(score)
             fe_pct = _score_to_pct_ferry(score)
