@@ -253,7 +253,7 @@ def _fmt_prob(text):
 # Open-Meteo: 複数地点 batched 取得（最悪値採用）
 # ============================================================
 
-def _fetch_forecast(days=8, timeout=30, max_retries=3):
+def _fetch_forecast(days=8, timeout=60, max_retries=3):
     """
     ROUTE_POINTS の3地点を1リクエストに集約し、
     各日で全地点の最悪値を採用した day_list を返す。
