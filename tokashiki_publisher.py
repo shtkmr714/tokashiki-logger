@@ -235,6 +235,30 @@ def _get_jma_probability():
         return {}
 
 
+def _load_active_suspensions():
+    """
+    planned_suspensions.json を読み込み、today <= end のものだけ返す。
+    ファイルが存在しない・空の場合は [] を返す。
+    """
+    json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "planned_suspensions.json")
+    try:
+        import json as _json
+        with open(json_path, encoding="utf-8") as f:
+            all_sus = _json.load(f)
+        today = datetime.now(JST).date()
+        active = [
+            s for s in all_sus
+            if s.get("start") and s.get("end")
+            and datetime.strptime(s["end"], "%Y-%m-%d").date() >= today
+        ]
+        if active:
+            print(f"  [計画運休] {len(active)}件（期限内）: {[s['vessel_ja'] for s in active]}")
+        return active
+    except Exception as e:
+        print(f"  [警告] planned_suspensions.json 読み込みエラー: {e}")
+        return []
+
+
 def _fmt_wave(text):
     """気象庁波高テキストを整形（メートル→m）"""
     if not text:
@@ -844,11 +868,12 @@ def _post_to_instagram(image_urls, caption):
 # キャプション生成（座間味と同じ6段階コメント）
 # ============================================================
 
-def _build_caption(forecast, now):
+def _build_caption(forecast, now, suspensions=None):
     short = forecast["short_term"]
     lt    = forecast["long_term"]
     s0    = short[0] if short else {}
     s1    = short[1] if len(short) > 1 else {}
+    suspensions = suspensions or []
 
     # 長期期間の表記
     if lt["has_risk"]:
@@ -912,11 +937,24 @@ def _build_caption(forecast, now):
     dl0 = s0.get("date_label", ""); dl1 = s1.get("date_label", "")
     dl0_en = s0.get("date_label_en", ""); dl1_en = s1.get("date_label_en", "")
 
+    # 計画運休ライン（期限内のものだけ表示）
+    sus_lines_ja = "".join(
+        f"⚠️ {s['vessel_ja']}は{s['start'][5:].replace('-','/')}〜"
+        f"{s['end'][5:].replace('-','/')} {s['reason_ja']}運休中\n"
+        for s in suspensions
+    )
+    sus_lines_en = "".join(
+        f"⚠️ {s['vessel_en']} Suspended {s['start'][5:].replace('-','/')} - "
+        f"{s['end'][5:].replace('-','/')} ({s['reason_en']})\n"
+        for s in suspensions
+    )
+
     ig_caption = (
         f"{forecast['update_date_ja']} {forecast['generated_at_label']}\n"
         f"渡嘉敷航路 欠航リスク予報\n"
         f"\n"
-        f"■欠航可能性\n"
+        + sus_lines_ja
+        + f"■欠航可能性\n"
         f"明日 {dl0}  高速船 {hs0}% / フェリー {fe0}%\n"
         f"明後日 {dl1} 高速船 {hs1}% / フェリー {fe1}%\n"
         f"長期（{lt_period_ja}）: {lt['risk_period'] if lt['has_risk'] else '懸念なし'} "
@@ -929,6 +967,7 @@ def _build_caption(forecast, now):
         + f"{forecast['update_date_en']} updated\n"
         + "Tokashiki Route  Cancellation Risk Forecast\n"
         + "\n"
+        + sus_lines_en
         + "■Boat/Ferry Cancellation Risk\n"
         + f"Tomorrow ({dl0_en}) Marine Liner {hs0}% / Ferry {fe0}%\n"
         + f"Day After ({dl1_en}) Marine Liner {hs1}% / Ferry {fe1}%\n"
@@ -957,6 +996,9 @@ def run_tokashiki_publisher(weather=None):
     print(f"\n{'='*50}")
     print(f"Tokashiki Publisher: {now.strftime('%Y-%m-%d %H:%M')}")
     print("="*50)
+
+    # [P0] 計画運休情報読み込み（期限内のものだけ抽出）
+    suspensions = _load_active_suspensions()
 
     # [P1] 8日間予報取得（3〜7日先 = index3〜7 を表示するため8日分必要）
     print("\n[P1] 8日間予報取得中（3地点 batched）...")
@@ -998,7 +1040,7 @@ def run_tokashiki_publisher(weather=None):
     image_urls = _upload_images_to_github(paths)
 
     # [P4] Instagram 投稿
-    caption = _build_caption(forecast, now)
+    caption = _build_caption(forecast, now, suspensions=suspensions)
 
     # 午後便（12時以降）は欠航リスクが高い場合のみInstagram投稿（座間味と同じロジック）
     # 条件: 短期（明日・明後日）+ 長期（3〜7日先）全期間のいずれかで欠航確率 61% 以上
