@@ -235,6 +235,64 @@ def _get_jma_probability():
         return {}
 
 
+_SLACK_ALERT_THRESHOLD = 61  # この%以上で通知
+
+
+def _send_slack_alert(forecast, now):
+    """
+    短期＋長期のいずれかで欠航リスクが閾値以上なら Slack に通知。
+    内容は欠航可能性%のみ（波高等の気象データは含めない）。
+    """
+    webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        print("  [Slack スキップ] SLACK_WEBHOOK_URL 未設定")
+        return
+
+    short   = forecast.get("short_term", [])
+    lt      = forecast.get("long_term", {})
+    lt_days = lt.get("days", [])
+
+    # 短期＋長期全期間の最大%
+    max_all = max(
+        [max(d.get("hs_pct") or 0, d.get("fe_pct") or 0) for d in short] +
+        [max(d.get("hs_pct") or 0, d.get("fe_pct") or 0) for d in lt_days],
+        default=0
+    )
+
+    if max_all < _SLACK_ALERT_THRESHOLD:
+        print(f"  [Slack スキップ] 全期間最大リスク {max_all}% < {_SLACK_ALERT_THRESHOLD}%")
+        return
+
+    DAY_JA = ["（月）","（火）","（水）","（木）","（金）","（土）","（日）"]
+    lines  = [
+        f"🚨 欠航リスクアラート【渡嘉敷航路】{now.strftime('%-m/%-d %H:%M')}更新",
+        "",
+    ]
+    for d in short:
+        dt      = datetime.strptime(d["date"], "%Y-%m-%d")
+        max_pct = max(d.get("hs_pct") or 0, d.get("fe_pct") or 0)
+        icon    = "🔴" if max_pct >= 81 else ("🟠" if max_pct >= 61 else "🟡")
+        hs_str  = f"高速船 {d['hs_pct']}%" if d.get("hs_pct") is not None else "高速船 データなし"
+        fe_str  = f"フェリー {d['fe_pct']}%" if d.get("fe_pct") is not None else "フェリー データなし"
+        lines.append(f"{icon} {d['label_ja']} {dt.strftime('%-m/%-d')}{DAY_JA[dt.weekday()]}")
+        lines.append(f"  {hs_str}  /  {fe_str}")
+    lines.append("")
+    if lt.get("has_risk"):
+        lines.append(f"📅 長期（3〜7日先）  最大 {lt['max_pct']}%  {lt['risk_period']}")
+    else:
+        lines.append(f"📅 長期（3〜7日先）  懸念なし（最大 {lt.get('max_pct', 0)}%）")
+    lines += ["", "⚠️ AI予測・参考値"]
+
+    try:
+        resp = requests.post(webhook_url, json={"text": "\n".join(lines)}, timeout=10)
+        if resp.status_code == 200:
+            print(f"  ✅ Slack アラート送信（最大リスク {max_all}%）")
+        else:
+            print(f"  [警告] Slack 送信失敗: {resp.status_code}")
+    except Exception as e:
+        print(f"  [警告] Slack 送信エラー: {e}")
+
+
 def _load_active_suspensions():
     """
     planned_suspensions.json を読み込み、today <= end のものだけ返す。
@@ -1020,6 +1078,9 @@ def run_tokashiki_publisher(weather=None):
 
     # [P1c] 構造化予報データ構築
     forecast = _build_forecast_data(day_list, jma_waves=jma_waves, jma_prob=jma_prob)
+
+    # [P1d] Slack アラート（61%以上の場合のみ）
+    _send_slack_alert(forecast, now)
 
     # [P2] 画像生成
     print("\n[P2] 画像生成中...")
