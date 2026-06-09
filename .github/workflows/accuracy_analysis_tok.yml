@@ -1,0 +1,19 @@
+﻿name: Accuracy Analysis Tokashiki (one-time)
+on:
+  workflow_dispatch:
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GOOGLE_SHEETS_ID: 
+      GOOGLE_SHEETS_ID_TOKASHIKI: ${{ secrets.GOOGLE_SHEETS_ID_TOKASHIKI }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install gspread google-auth
+      - name: Run accuracy analysis (Tokashiki)
+        run: python analyze_accuracy.py
