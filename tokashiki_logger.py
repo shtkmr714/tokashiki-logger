@@ -11,6 +11,11 @@ GitHub Actions から呼び出す。
   マリンライナーとかしき: marine_bin1（泊港発）, marine_bin2（渡嘉敷港発）
   フェリーとかしき:       ferry_bin1（泊港発 10:00）, ferry_bin2（渡嘉敷港発 16:00）
   ferry_turnaround:       折り返し運航フラグ（1=折り返しのみ）
+
+【データ系統の注意（精度検証の前提）】
+  swell_period_max / gust_max 列は 2026-06-09 に追加。それ以前の行は空欄。
+  publisher のスコアは swell_period・gust も使うため、スコア再現を伴う
+  精度検証は 2026-06-09 以降のデータで行うこと。
 """
 
 import os
@@ -69,6 +74,9 @@ SHEET_HEADERS = [
     "marine_am_weather_cancel",  # 泊港発が気象欠航（0/1）
     "marine_pm_weather_cancel",  # 渡嘉敷港発が気象欠航（0/1）
     "ferry_weather_cancel",      # フェリーが1便以上気象欠航（0/1）
+    # 追加気象データ（publisher のスコア計算で使用・2026-06追加）
+    "swell_period_max",          # 当日の最大うねり周期（秒）
+    "gust_max",                  # 当日の最大突風（m/s）
 ]
 
 
@@ -399,13 +407,15 @@ def get_marine_weather_data():
     航路代表3地点（ROUTE_POINTS）を1リクエストで取得し、各日で全地点の
     最大値（最悪値）を採用する。単一中間点による最悪区間の過小評価を防ぐ。"""
     result = {
-        "today_max_wave":    None,
-        "today_max_swell":   None,
-        "today_max_wind":    None,
-        "tmr_max_wave":      None,
-        "tmr_max_swell":     None,
-        "tmr_max_wind":      None,
-        "dayafter_max_wave": None,
+        "today_max_wave":     None,
+        "today_max_swell":    None,
+        "today_max_wind":     None,
+        "today_swell_period": None,
+        "today_gust":         None,
+        "tmr_max_wave":       None,
+        "tmr_max_swell":      None,
+        "tmr_max_wind":       None,
+        "dayafter_max_wave":  None,
     }
 
     try:
@@ -415,19 +425,31 @@ def get_marine_weather_data():
         marine_url = (
             f"https://marine-api.open-meteo.com/v1/marine"
             f"?latitude={lats}&longitude={lons}"
-            f"&hourly=wave_height,swell_wave_height"
+            f"&hourly=wave_height,swell_wave_height,swell_wave_period"
             f"&timezone=Asia%2FTokyo&forecast_days=3"
         )
-        marine_locs = _as_location_list(requests.get(marine_url, timeout=15).json())
-
         weather_url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lats}&longitude={lons}"
-            f"&hourly=wind_speed_10m"
+            f"&hourly=wind_speed_10m,wind_gusts_10m"
             f"&wind_speed_unit=ms"
             f"&timezone=Asia%2FTokyo&forecast_days=3"
         )
-        weather_locs = _as_location_list(requests.get(weather_url, timeout=15).json())
+
+        # タイムアウト/レート制限対策：リトライ付きで取得
+        import time as _time
+        def _get_json(url, retries=3, timeout=30):
+            for attempt in range(retries):
+                try:
+                    return requests.get(url, timeout=timeout).json()
+                except Exception as e:
+                    print(f"  [警告] Open-Meteo取得リトライ {attempt+1}/{retries}: {e}")
+                    if attempt < retries - 1:
+                        _time.sleep(5 * (attempt + 1))
+            return None
+
+        marine_locs  = _as_location_list(_get_json(marine_url)  or {})
+        weather_locs = _as_location_list(_get_json(weather_url) or {})
 
         now = datetime.now(JST)
 
@@ -445,13 +467,15 @@ def get_marine_weather_data():
                     best = m if best is None else max(best, m)
             return round(best, 2) if best is not None else None
 
-        result["today_max_wave"]    = _daily_max(marine_locs,  "wave_height",       0)
-        result["today_max_swell"]   = _daily_max(marine_locs,  "swell_wave_height", 0)
-        result["today_max_wind"]    = _daily_max(weather_locs, "wind_speed_10m",    0)
-        result["tmr_max_wave"]      = _daily_max(marine_locs,  "wave_height",       1)
-        result["tmr_max_swell"]     = _daily_max(marine_locs,  "swell_wave_height", 1)
-        result["tmr_max_wind"]      = _daily_max(weather_locs, "wind_speed_10m",    1)
-        result["dayafter_max_wave"] = _daily_max(marine_locs,  "wave_height",       2)
+        result["today_max_wave"]     = _daily_max(marine_locs,  "wave_height",       0)
+        result["today_max_swell"]    = _daily_max(marine_locs,  "swell_wave_height", 0)
+        result["today_max_wind"]     = _daily_max(weather_locs, "wind_speed_10m",    0)
+        result["today_swell_period"] = _daily_max(marine_locs,  "swell_wave_period", 0)
+        result["today_gust"]         = _daily_max(weather_locs, "wind_gusts_10m",    0)
+        result["tmr_max_wave"]       = _daily_max(marine_locs,  "wave_height",       1)
+        result["tmr_max_swell"]      = _daily_max(marine_locs,  "swell_wave_height", 1)
+        result["tmr_max_wind"]       = _daily_max(weather_locs, "wind_speed_10m",    1)
+        result["dayafter_max_wave"]  = _daily_max(marine_locs,  "wave_height",       2)
 
         print(f"  [Open-Meteo] 本日 波高{result['today_max_wave']}m "
               f"うねり{result['today_max_swell']}m 風速{result['today_max_wind']}m/s")
@@ -490,6 +514,14 @@ def log_daily_record():
 
         try:
             ws = sh.worksheet(SHEET_NAME)
+            # 既存シートのヘッダーが旧形式なら最新ヘッダーに更新（列追加対応）
+            try:
+                existing_header = ws.row_values(1)
+                if "swell_period_max" not in existing_header:
+                    ws.update("A1", [SHEET_HEADERS])
+                    print("  tokashiki_operation_log ヘッダーを更新（swell_period_max/gust_max 追加）")
+            except Exception as he:
+                print(f"  [警告] ヘッダー更新スキップ: {he}")
         except Exception:
             ws = sh.add_worksheet(title=SHEET_NAME, rows=5000, cols=len(SHEET_HEADERS))
             ws.append_row(SHEET_HEADERS)
@@ -544,6 +576,8 @@ def log_daily_record():
         marine_am_w_cancel,
         marine_pm_w_cancel,
         ferry_w_cancel,
+        weather["today_swell_period"],   # swell_period_max
+        weather["today_gust"],           # gust_max
     ]
 
     try:
