@@ -1,0 +1,29 @@
+# === 秘密情報（絶対にコミットしない） ===
+# 認証情報はすべて GitHub Actions Secrets（環境変数）で渡す。鍵ファイルはコミットしない。
+*-service-account*.json
+*serviceaccount*.json
+*Token*.txt
+*token*.txt
+secrets_*.txt
+.env
+.env.*
+
+# === ローカル生成物・キャッシュ ===
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# === テスト・モック出力 ===
+test_output/
+out/
+*_mockup.py
+test_*.py
+
+# === Claude Code ローカル設定 ===
+.claude/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# 注意: planned_suspensions.json は本番実行に必要なためコミット対象。除外しないこと。
