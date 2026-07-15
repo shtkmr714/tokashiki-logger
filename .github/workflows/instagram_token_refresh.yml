@@ -1,0 +1,78 @@
+name: Instagram Token Refresh
+
+# Instagram の長期トークンは60日で失効する。2026年7月8日に失効して投稿が
+# 1週間止まったため、月2回（1日・15日）自動で延長し、成否をSlackに通知する。
+# 各リポジトリは「自分のシークレットだけ」を更新する（他リポには触れない）。
+on:
+  schedule:
+    - cron: '0 3 1,15 * *'   # 12:00 JST（1日・15日）
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refresh long-lived token and update the repo secret
+        env:
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          notify() {
+            [ -n "${SLACK_WEBHOOK_URL:-}" ] || return 0
+            jq -n --arg t "$1" '{text:$t}' \
+              | curl -s -X POST -H 'Content-type: application/json' -d @- "$SLACK_WEBHOOK_URL" >/dev/null || true
+          }
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "DISPATCH_TOKEN が未設定です（Secrets の書き込み権限を持つ PAT が必要）"
+            notify "🚨 ${GITHUB_REPOSITORY}: Instagramトークンの自動延長ができません（DISPATCH_TOKEN 未設定）"
+            exit 1
+          fi
+
+          # 1) トークンを延長（Instagram Login 方式。App Secret は不要）
+          code=$(curl -s -o /tmp/refresh.json -w "%{http_code}" \
+            "https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${INSTAGRAM_ACCESS_TOKEN}")
+          if [ "$code" != "200" ]; then
+            msg=$(jq -r '.error.message // "unknown error"' /tmp/refresh.json)
+            echo "延長に失敗: HTTP ${code} / ${msg}"
+            notify "🚨 ${GITHUB_REPOSITORY}: Instagramトークンの延長に失敗しました（HTTP ${code}）: ${msg}"
+            exit 1
+          fi
+
+          NEW_TOKEN=$(jq -r '.access_token // empty' /tmp/refresh.json)
+          echo "::add-mask::${NEW_TOKEN}"
+          EXPIRES_IN=$(jq -r '.expires_in // 0' /tmp/refresh.json)
+          if [ -z "$NEW_TOKEN" ]; then
+            notify "🚨 ${GITHUB_REPOSITORY}: 延長レスポンスに access_token がありません"
+            exit 1
+          fi
+
+          # 2) 新トークンが実際に使えることを確認してから保存する
+          #    （壊れたトークンで上書きすると翌朝の投稿が丸ごと落ちるため）
+          code=$(curl -s -o /tmp/me.json -w "%{http_code}" \
+            "https://graph.instagram.com/me?fields=user_id,username&access_token=${NEW_TOKEN}")
+          if [ "$code" != "200" ]; then
+            echo "新トークンの検証に失敗: HTTP ${code}"
+            notify "🚨 ${GITHUB_REPOSITORY}: 延長後のトークン検証に失敗（HTTP ${code}）。シークレットは更新していません"
+            exit 1
+          fi
+          USERNAME=$(jq -r '.username // "?"' /tmp/me.json)
+
+          # 3) シークレットを更新（コマンドライン露出を避けるため stdin 経由）
+          umask 077
+          printf '%s' "$NEW_TOKEN" > /tmp/token.txt
+          if ! gh secret set INSTAGRAM_ACCESS_TOKEN --repo "$GITHUB_REPOSITORY" < /tmp/token.txt; then
+            echo "シークレット更新に失敗（DISPATCH_TOKEN の権限不足の可能性）"
+            notify "🚨 ${GITHUB_REPOSITORY}: トークンは延長できましたが、シークレット更新に失敗しました（PATの権限を確認）"
+            rm -f /tmp/token.txt
+            exit 1
+          fi
+          rm -f /tmp/token.txt /tmp/refresh.json /tmp/me.json
+
+          DAYS=$(( EXPIRES_IN / 86400 ))
+          EXPIRES_ON=$(date -u -d "+${DAYS} days" +%Y-%m-%d)
+          echo "延長完了: @${USERNAME} / あと約${DAYS}日（${EXPIRES_ON} 頃まで）"
+          notify "✅ ${GITHUB_REPOSITORY}: Instagramトークンを延長しました（@${USERNAME} / 有効期限 ${EXPIRES_ON} 頃）"
