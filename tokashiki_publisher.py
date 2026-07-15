@@ -19,6 +19,7 @@ import os
 import math
 import time
 import base64
+import traceback
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -1093,6 +1094,40 @@ def _upload_images_to_github(image_paths):
     return urls
 
 
+_SECRET_ENV_KEYS = (
+    "INSTAGRAM_ACCESS_TOKEN",
+    "SLACK_WEBHOOK_URL",
+    "DISPATCH_TOKEN",
+    "GITHUB_TOKEN",
+)
+
+
+def _redact_secrets(text):
+    """例外メッセージにはトークン付きURLが含まれうる。Slackは自動マスクしないので自前で伏せる。"""
+    out = str(text)
+    for key in _SECRET_ENV_KEYS:
+        val = os.environ.get(key)
+        if val and len(val) >= 8:
+            out = out.replace(val, f"***{key}***")
+    return out
+
+
+def _alert_slack(message):
+    """障害をSlackに流す。投稿停止に気づけるようにするための最低限の通知。"""
+    webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        print("  [Slack スキップ] SLACK_WEBHOOK_URL 未設定")
+        return
+    try:
+        requests.post(webhook_url, json={"text": f"🚨 {_redact_secrets(message)}"}, timeout=10)
+    except Exception as e:
+        print(f"  [警告] Slack 通知エラー: {e}")
+
+
+class InstagramPostError(Exception):
+    """Instagram投稿の失敗。呼び出し側で通知しジョブを失敗させるために送出する。"""
+
+
 def _post_to_instagram(image_urls, caption):
     access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
     user_id      = os.environ.get("INSTAGRAM_USER_ID")
@@ -1131,8 +1166,7 @@ def _post_to_instagram(image_urls, caption):
             )
             data = resp.json()
             if "id" not in data:
-                print(f"  [エラー] メディアコンテナ作成失敗: {data}")
-                return False
+                raise InstagramPostError(f"メディアコンテナ作成失敗: {data}")
             media_ids.append(data["id"])
 
         resp = requests.post(
@@ -1142,8 +1176,7 @@ def _post_to_instagram(image_urls, caption):
         )
         data = resp.json()
         if "id" not in data:
-            print(f"  [エラー] カルーセル作成失敗: {data}")
-            return False
+            raise InstagramPostError(f"カルーセル作成失敗: {data}")
         carousel_id = data["id"]
 
         print("  [Instagram] 処理待機（30秒）...")
@@ -1155,15 +1188,15 @@ def _post_to_instagram(image_urls, caption):
         )
         data = resp.json()
         if "id" not in data:
-            print(f"  [エラー] 投稿失敗: {data}")
-            return False
+            raise InstagramPostError(f"投稿の公開に失敗: {data}")
 
         print(f"  ✅ Instagram投稿完了: post_id={data['id']}")
         return True
 
+    except InstagramPostError:
+        raise
     except Exception as e:
-        print(f"  [警告] Instagram投稿エラー: {e}")
-        return False
+        raise InstagramPostError(f"Instagram投稿エラー: {e}") from e
 
 
 # ============================================================
@@ -1366,7 +1399,13 @@ def run_tokashiki_publisher(weather=None):
         print(f"  [午後便] 最大欠航リスク {max_pct}% ≥ 61% → Instagram投稿実行")
 
     print(f"\n[P4] Instagram 投稿中...")
-    _post_to_instagram(image_urls, caption)
+    try:
+        _post_to_instagram(image_urls, caption)
+    except Exception as e:
+        # 握り潰すとトークン失効などで投稿が止まっても success のままになり気づけない。
+        traceback.print_exc()
+        _alert_slack(f"渡嘉敷: Instagram投稿に失敗しました: {e}")
+        raise
 
     print("\n✅ Tokashiki Publisher 完了")
 

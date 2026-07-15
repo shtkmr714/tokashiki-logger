@@ -620,5 +620,9 @@ if __name__ == "__main__":
         from tokashiki_publisher import run_tokashiki_publisher
         run_tokashiki_publisher(weather=weather)
     except Exception as e:
-        print(f"  [警告] Instagram投稿エラー: {e}")
+        # 握り潰すと投稿が止まっても success のままになり気づけない。
+        # 通知は publisher 側で送っているので、ここではジョブを失敗させる。
+        import traceback; traceback.print_exc()
+        print(f"  [エラー] 渡嘉敷: Instagram投稿に失敗しました: {e}")
+        raise
     print("\n完了。")
