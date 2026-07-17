@@ -16,6 +16,7 @@ tokashiki_logger.py の log_daily_record() から呼び出す。
 """
 
 import os
+import json
 import math
 import time
 import base64
@@ -1128,16 +1129,106 @@ class InstagramPostError(Exception):
     """Instagram投稿の失敗。呼び出し側で通知しジョブを失敗させるために送出する。"""
 
 
+# ============================================================
+# 投稿の重複ガード
+# ============================================================
+# この島は2つの経路で起動される：
+#   1) cron-job.org → kucha-ferry-alert → dispatch（8:15頃・14:30）
+#   2) このリポジトリ自身の cron（1が動かなかったときの fallback）
+# 2は GitHub のスケジューラ遅延で毎朝9時台に発火し、1の直後に同じ内容を
+# もう1本投稿していた（2026-07-04〜07-17 は毎朝重複）。時刻ガードは
+# workflow_dispatch を通すため、この重複を防げない。
+# そこで「その日その枠で投稿済みか」をリポジトリ内の state ファイルで判定する。
+# これにより 2 は本来の fallback（1が落ちた時だけ投稿）として機能する。
+
+POST_STATE_PATH = "state/last_post.json"
+
+
+def _post_slot(now):
+    """投稿枠。午後便の判定（now.hour >= 12）と同じ境界で朝／午後を分ける。"""
+    return "afternoon" if now.hour >= 12 else "morning"
+
+
+def _post_key(now):
+    return f"{now.strftime('%Y-%m-%d')}_{_post_slot(now)}"
+
+
+def _post_state_api():
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    return f"https://api.github.com/repos/{repo}/contents/{POST_STATE_PATH}"
+
+
+def _post_state_headers():
+    token = os.environ.get("GITHUB_TOKEN")
+    return {"Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json"}
+
+
+def _read_post_state():
+    """(state_dict, sha) を返す。未作成なら ({}, None)、判定不能なら (None, None)。"""
+    if not os.environ.get("GITHUB_TOKEN") or not os.environ.get("GITHUB_REPOSITORY"):
+        return None, None
+    resp = requests.get(_post_state_api(), headers=_post_state_headers(), timeout=15)
+    if resp.status_code == 404:
+        return {}, None
+    if resp.status_code != 200:
+        raise RuntimeError(f"投稿状態の取得に失敗: HTTP {resp.status_code}")
+    body = resp.json()
+    state = json.loads(base64.b64decode(body["content"]).decode())
+    return state, body["sha"]
+
+
+def _already_posted(now):
+    if os.environ.get("FORCE_POST") == "1":
+        print("  [重複ガード] FORCE_POST=1 のため判定をスキップ")
+        return False
+    try:
+        state, _ = _read_post_state()
+    except Exception as e:
+        # 読めないときは投稿する。重複より「予報が出ない」ほうが損失が大きい。
+        print(f"  [警告] 投稿状態を読めませんでした（投稿を継続します）: {e}")
+        return False
+    if state is None:
+        print("  [重複ガード] GITHUB_TOKEN 未設定のため判定不能（投稿を継続します）")
+        return False
+    return state.get("last_post_key") == _post_key(now)
+
+
+def _mark_posted(now, post_id):
+    """投稿成功を記録する。ここが失敗しても投稿自体は成功しているのでジョブは落とさない。"""
+    try:
+        _, sha = _read_post_state()
+        payload = {
+            "last_post_key": _post_key(now),
+            "posted_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "post_id": post_id,
+        }
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        content = base64.b64encode((body + chr(10)).encode()).decode()
+        data = {"message": f"Auto: last_post {_post_key(now)}",
+                "content": content, "branch": "main"}
+        if sha:
+            data["sha"] = sha
+        resp = requests.put(_post_state_api(), json=data,
+                            headers=_post_state_headers(), timeout=15)
+        if resp.status_code not in (200, 201):
+            print(f"  [警告] 投稿状態の記録に失敗: HTTP {resp.status_code}")
+        else:
+            print(f"  [重複ガード] 投稿済みとして記録: {_post_key(now)}")
+    except Exception as e:
+        print(f"  [警告] 投稿状態の記録に失敗（投稿自体は成功）: {e}")
+
+
 def _post_to_instagram(image_urls, caption):
     access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
     user_id      = os.environ.get("INSTAGRAM_USER_ID")
 
     if not access_token or not user_id:
         print("  [スキップ] INSTAGRAM_ACCESS_TOKEN / INSTAGRAM_USER_ID 未設定")
-        return False
+        return None
     if not image_urls:
         print("  [スキップ] 画像URLなし")
-        return False
+        return None
 
     try:
         # GitHub Pages が実際にファイルを配信するまでポーリング（最大5分）
@@ -1191,7 +1282,7 @@ def _post_to_instagram(image_urls, caption):
             raise InstagramPostError(f"投稿の公開に失敗: {data}")
 
         print(f"  ✅ Instagram投稿完了: post_id={data['id']}")
-        return True
+        return data["id"]
 
     except InstagramPostError:
         raise
@@ -1399,13 +1490,22 @@ def run_tokashiki_publisher(weather=None):
         print(f"  [午後便] 最大欠航リスク {max_pct}% ≥ 61% → Instagram投稿実行")
 
     print(f"\n[P4] Instagram 投稿中...")
+    if _already_posted(now):
+        print(f"  [スキップ] {_post_key(now)} はすでに投稿済み（重複起動）")
+        print("\n✅ Tokashiki Publisher 完了")
+        return
+
     try:
-        _post_to_instagram(image_urls, caption)
+        post_id = _post_to_instagram(image_urls, caption)
     except Exception as e:
         # 握り潰すとトークン失効などで投稿が止まっても success のままになり気づけない。
         traceback.print_exc()
         _alert_slack(f"渡嘉敷: Instagram投稿に失敗しました: {e}")
         raise
+
+    # スキップ時は post_id が None。記録すると fallback が塞がるので投稿できた時だけ記録する。
+    if post_id:
+        _mark_posted(now, post_id)
 
     print("\n✅ Tokashiki Publisher 完了")
 
