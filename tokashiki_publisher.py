@@ -929,8 +929,18 @@ def make_image_longterm(forecast, output_path):
         draw.text((scx, 314), lt["risk_period_en"],
                   font=f["period_en"], fill=(110, 120, 140), anchor="mm")
     else:
-        draw.text((scx, 290), "懸念なし  No Significant Risk",
-                  font=f["period"], fill=(46, 125, 50), anchor="mm")
+        # 「懸念なし No Significant Risk」はf["period"](54px)だとカード幅(432〜1214)を
+        # 超えて左右にはみ出し区切り線にも迫るため、カード内に収まるよう自動縮小する。
+        text = "懸念なし  No Significant Risk"
+        max_w = (sc[2] - sc[0]) - 84   # カード幅から左右マージン
+        size = 54
+        while size > 34:
+            fnt = _load_font(FONT_BOLD, size)
+            if draw.textbbox((0, 0), text, font=fnt)[2] <= max_w:
+                break
+            size -= 2
+        draw.text((scx, 288), text, font=_load_font(FONT_BOLD, size),
+                  fill=(46, 125, 50), anchor="mm")
 
     # ── 可変: 船種別 最大%（運休除外）──
     hs_running = [d["hs_pct"] for d in lt["days"] if not d.get("suspended_highspeed")]
