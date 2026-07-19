@@ -540,10 +540,18 @@ def _build_forecast_data(day_list, jma_waves=None, jma_prob=None):
     )
 
     if risk_dates:
+        _rs, _re = risk_dates[0], risk_dates[-1]
+        # リスク日が1日なら単日表示（「X〜X頃」にしない。座間味・渡嘉敷・西表で統一）
+        if _rs == _re:
+            _rp = f"{_rs.strftime('%-m/%-d')}頃"
+            _rp_en = f"Around {_rs.strftime('%b %-d')}"
+        else:
+            _rp = f"{_rs.strftime('%-m/%-d')}〜{_re.strftime('%-m/%-d')}頃"
+            _rp_en = f"Around {_rs.strftime('%b %-d')} - {_re.strftime('%b %-d')}"
         long_term = {
             "has_risk":       True,
-            "risk_period":    f"{risk_dates[0].strftime('%-m/%-d')}〜{risk_dates[-1].strftime('%-m/%-d')}頃",
-            "risk_period_en": f"Around {risk_dates[0].strftime('%b %-d')} - {risk_dates[-1].strftime('%b %-d')}",
+            "risk_period":    _rp,
+            "risk_period_en": _rp_en,
             "max_pct":        max_lt_pct,
             "days":           lt_days,
         }
