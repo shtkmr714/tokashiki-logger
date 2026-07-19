@@ -541,12 +541,12 @@ def _build_forecast_data(day_list, jma_waves=None, jma_prob=None):
 
     if risk_dates:
         _rs, _re = risk_dates[0], risk_dates[-1]
-        # リスク日が1日なら単日表示（「X〜X頃」にしない。座間味・渡嘉敷・西表で統一）
+        # リスク日が1日なら単日表示（「X〜X」にしない。座間味・渡嘉敷・西表で統一）
         if _rs == _re:
-            _rp = f"{_rs.strftime('%-m/%-d')}頃"
+            _rp = _rs.strftime('%-m/%-d')
             _rp_en = f"Around {_rs.strftime('%b %-d')}"
         else:
-            _rp = f"{_rs.strftime('%-m/%-d')}〜{_re.strftime('%-m/%-d')}頃"
+            _rp = f"{_rs.strftime('%-m/%-d')}〜{_re.strftime('%-m/%-d')}"
             _rp_en = f"Around {_rs.strftime('%b %-d')} - {_re.strftime('%b %-d')}"
         long_term = {
             "has_risk":       True,
@@ -932,7 +932,7 @@ def make_image_longterm(forecast, output_path):
     scx = (sc[0] + sc[2]) // 2
     max_band = _risk_band(lt["max_pct"])
     if lt["has_risk"]:
-        draw.text((scx, 272), lt["risk_period"].replace("頃", ""),
+        draw.text((scx, 272), lt["risk_period"],
                   font=f["period"], fill=max_band[2], anchor="mm")
         draw.text((scx, 314), lt["risk_period_en"],
                   font=f["period_en"], fill=(110, 120, 140), anchor="mm")
