@@ -1,0 +1,34 @@
+name: Image Layout Check
+
+# 画像レイアウトの回帰検査。カード/枠からの文字・白背景はみ出し、クラッシュ、サイズ崩れを push 時に検出。
+# 詳細は check_image_layout.py 冒頭を参照。
+
+on:
+  push:
+    paths:
+      - '**.py'
+      - 'assets/templates/**'
+      - '.github/workflows/image_layout_check.yml'
+  workflow_dispatch:
+
+jobs:
+  layout-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pillow
+
+      - name: Install Japanese fonts (本番相当)
+        run: sudo apt-get install -y fonts-noto-cjk
+
+      - name: Run image layout check
+        run: python check_image_layout.py

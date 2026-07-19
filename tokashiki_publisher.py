@@ -544,10 +544,10 @@ def _build_forecast_data(day_list, jma_waves=None, jma_prob=None):
         # リスク日が1日なら単日表示（「X〜X」にしない。座間味・渡嘉敷・西表で統一）
         if _rs == _re:
             _rp = _rs.strftime('%-m/%-d')
-            _rp_en = f"Around {_rs.strftime('%b %-d')}"
+            _rp_en = _rs.strftime('%b %-d')
         else:
             _rp = f"{_rs.strftime('%-m/%-d')}〜{_re.strftime('%-m/%-d')}"
-            _rp_en = f"Around {_rs.strftime('%b %-d')} - {_re.strftime('%b %-d')}"
+            _rp_en = f"{_rs.strftime('%b %-d')} - {_re.strftime('%b %-d')}"
         long_term = {
             "has_risk":       True,
             "risk_period":    _rp,
