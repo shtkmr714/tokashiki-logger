@@ -25,7 +25,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pillow
+        run: pip install pillow requests
 
       - name: Install Japanese fonts (本番相当)
         run: sudo apt-get install -y fonts-noto-cjk
