@@ -457,10 +457,23 @@ def _fetch_forecast(days=8, timeout=60, max_retries=3):
 # 予報データ構築（座間味と同じ構造の dict を返す）
 # ============================================================
 
-def _build_forecast_data(day_list, jma_waves=None, jma_prob=None):
+def _suspension_flags(date_str, suspensions):
+    """date_str(YYYY-MM-DD) が計画運休期間内なら (高速船運休, フェリー運休) を返す。"""
+    hs = fe = False
+    for s in suspensions or []:
+        if s.get("start", "") <= date_str <= s.get("end", ""):
+            svc = s.get("service")
+            hs = hs or svc in ("highspeed", "both")
+            fe = fe or svc in ("ferry", "both")
+    return hs, fe
+
+
+def _build_forecast_data(day_list, jma_waves=None, jma_prob=None, suspensions=None):
     """
     day_list から構造化予報データを構築。
     short_term（明日・明後日）、long_term（3〜7日先）、weather_data を返す。
+    suspensions: planned_suspensions.json の期限内エントリ。該当日の船種は運休表示にする
+      （以前は常に False 固定で、ドック期間中も画像に欠航%が出ていた＝座間味 2026-11 と同種）。
     """
     jma_waves = jma_waves or {}
     jma_prob  = jma_prob  or {}
@@ -489,8 +502,10 @@ def _build_forecast_data(day_list, jma_waves=None, jma_prob=None):
         hs_pm = _hs_for_wave(d.get("max_wave_pm"))
         label_ja = "明日" if delta == 1 else "明後日"
         label_en = "Tomorrow" if delta == 1 else "Day After"
+        _date = d.get("date", dt.strftime("%Y-%m-%d"))
+        sus_hs, sus_fe = _suspension_flags(_date, suspensions)
         short_term.append({
-            "date":           d.get("date", dt.strftime("%Y-%m-%d")),
+            "date":           _date,
             "date_label":     dt.strftime("%-m/%-d"),
             "date_label_en":  dt.strftime("%b %-d"),
             "label_ja":       label_ja,
@@ -499,8 +514,8 @@ def _build_forecast_data(day_list, jma_waves=None, jma_prob=None):
             "hs_am_pct":      hs_am,
             "hs_pm_pct":      hs_pm,
             "fe_pct":         fe_pct,
-            "suspended_highspeed": False,
-            "suspended_ferry":     False,
+            "suspended_highspeed": sus_hs,
+            "suspended_ferry":     sus_fe,
             "jma_wave":       jma_waves.get(label_ja, ""),
             "jma_prob":       jma_prob.get(label_ja, {}).get("level", ""),
             "max_wave":       d.get("max_wave"),
@@ -523,19 +538,23 @@ def _build_forecast_data(day_list, jma_waves=None, jma_prob=None):
             fe_pct = _score_to_pct_ferry(score)
         else:
             hs_pct = fe_pct = 1
+        _date = d.get("date", dt.strftime("%Y-%m-%d"))
+        sus_hs, sus_fe = _suspension_flags(_date, suspensions)
         lt_days.append({
-            "date":       d.get("date", dt.strftime("%Y-%m-%d")),
+            "date":       _date,
             "date_label": dt.strftime("%-m/%-d"),
             "hs_pct":     hs_pct,
             "fe_pct":     fe_pct,
-            "suspended_highspeed": False,
-            "suspended_ferry":     False,
+            "suspended_highspeed": sus_hs,
+            "suspended_ferry":     sus_fe,
         })
-        if max(hs_pct or 0, fe_pct or 0) >= 31:
+        # 運休中の船種は天候リスク判定から除外（座間味 forecast_publisher と同じ扱い）
+        if max(0 if sus_hs else (hs_pct or 0), 0 if sus_fe else (fe_pct or 0)) >= 31:
             risk_dates.append(dt)
 
     max_lt_pct = max(
-        (max(d["hs_pct"] or 0, d["fe_pct"] or 0) for d in lt_days),
+        (max(0 if d["suspended_highspeed"] else (d["hs_pct"] or 0),
+             0 if d["suspended_ferry"] else (d["fe_pct"] or 0)) for d in lt_days),
         default=0
     )
 
@@ -1482,7 +1501,8 @@ def run_tokashiki_publisher(weather=None):
     print(f"  JMA確率: {jma_prob}")
 
     # [P1c] 構造化予報データ構築
-    forecast = _build_forecast_data(day_list, jma_waves=jma_waves, jma_prob=jma_prob)
+    forecast = _build_forecast_data(day_list, jma_waves=jma_waves, jma_prob=jma_prob,
+                                    suspensions=suspensions)
 
     # [P1d] Slack アラート（61%以上の場合のみ）
     _send_slack_alert(forecast, now)
